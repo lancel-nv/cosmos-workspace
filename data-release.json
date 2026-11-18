@@ -1,10 +1,14 @@
 {
   "repo_id": "lancel-nv/robodojo-push-t-raw",
   "repo_type": "dataset",
-  "revision": null,
-  "status": "awaiting_visibility_confirmation_before_upload",
+  "revision": "56ef8345635c7bf6c750efae6bab67eaeba40f2e",
+  "private": true,
+  "status": "published_and_remote_verified",
   "episodes": 502,
   "success": 200,
   "failure": 302,
-  "format": "raw-only"
+  "format": "raw-only",
+  "manifest_sha256": "25e183ccd4b8eaa249fb5315a64210a2909094e476c3722631149e51acb226b0",
+  "verified_files": 2515,
+  "remote_verification": "All file sizes and Git blob/LFS SHA256 hashes; pinned download of manifest, README and two raw samples"
 }

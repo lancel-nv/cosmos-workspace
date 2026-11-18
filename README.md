@@ -37,8 +37,8 @@ python scripts/bootstrap_dependencies.py --component cosmos-curator
 
 ## 数据与训练边界
 
-HF 发布范围仅为有效的 502 条 raw 轨迹：200 成功、302 失败，三路原始相机、实测状态、命令、终止信息和 prompt。
-发布状态和固定版本以 `data-release.json` 为准；revision 为空时尚未完成上传。
+HF 私有仓库已发布有效的 502 条 raw 轨迹：200 成功、302 失败，三路原始相机、实测状态、命令、终止信息和 prompt。
+`data-release.json` 锁定已逐文件校验的 HF commit 和 manifest SHA256；下载需要有访问权限的账号。
 raw 不是训练 bundle；用户在新集群上运行处理脚本。不要把原始动作替换成未来实测状态，也不要训练终止观察行的占位动作。
 
 本项目的 Bimanual 训练使用 `cam_head` 单视角，不拼接腕部相机；首帧和动作是条件，后续 RGB 是监督目标。

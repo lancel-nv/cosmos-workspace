@@ -39,10 +39,11 @@ python scripts/bootstrap_dependencies.py --component cosmos-curator
 
 ## 2. 下载并校验 raw
 
-HF 仓库是 `lancel-nv/robodojo-push-t-raw`。使用账号已有权限认证，Token 不写进脚本。
+HF 仓库是私有的 `lancel-nv/robodojo-push-t-raw`。使用有访问权限的账号认证，Token 不写进脚本。
 使用发布完成后记录在 `data-release.json` 的 HF revision，不使用浮动 main 做正式实验。
 
 ```bash
+export PATH="$WORKSPACE/RoboDojo/.venv-lerobot/bin:$PATH"
 hf auth login
 python scripts/download_raw.py --output "$WORKSPACE/data/push-t-raw"
 RoboDojo/.venv-lerobot/bin/python scripts/raw_release.py verify \
