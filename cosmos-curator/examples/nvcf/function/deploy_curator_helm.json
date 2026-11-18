@@ -1,0 +1,72 @@
+{
+    "#comment": "# to remove commented attributes, except for this line",
+    "#availabilityZones": [
+        "zone1"
+    ],
+    "configuration": {
+        "image": {
+            "tag": "FILL_IN",
+            "repository": "nvcr.io/FILL_IN/cosmos-curator"
+        },
+        "resources": {
+            "requests": {
+                "nvidia.com/gpu": "FILL_IN"
+            },
+            "limits": {
+                "nvidia.com/gpu": "FILL_IN"
+            }
+        },
+        "shmem": {
+            "limit": "800Gi"
+        },
+        "metrics": {
+          "remoteWrite": {
+            "endpoint": "FILL_IN"
+          },
+          "enabled": true,
+          "otlp": {
+            "enabled": false
+          }
+        },
+        "otlp": {
+          "endpoint": "https://FILL_IN",
+          "extractNVCFSecrets": true,
+          "tls": {
+            "certPath": "/etc/curator-otlp/certs/tls.crt",
+            "keyPath": "/etc/curator-otlp/certs/tls.key"
+          },
+          "nvcfSecrets": {
+            "secretName": "nvcf-secrets",
+            "certKey": "otlp-client-crt",
+            "keyKey": "otlp-client-key"
+          }
+        },
+        "tracing": {
+          "otlp": {
+            "enabled": true
+          }
+        },
+        "logging": {
+          "format": "json",
+          "rayBackendJson": true,
+          "otlp": {
+            "enabled": false,
+            "includeMetricsExternalLabels": true
+          }
+        },
+        "networkPolicy": {
+          "enabled": false
+        },
+        "#commentScratch": "path to additional node storage on host",
+        "#scratchDir": "/scratch"
+    },
+    "#clusters": [
+        "cluster1"
+    ],
+    "#regions": [
+        "region1"
+    ],
+    "#attributes": [
+        "attr1"
+    ]
+}

@@ -1,0 +1,83 @@
+{
+    "#comment": "# to remove commented attributes, except for this line",
+    "#availabilityZones": [
+        "zone1"
+    ],
+    "configuration": {
+        "image": {
+            "tag": "${HELM_IMAGE_TAG}",
+            "repository": "nvcr.io/${NGC_NVCF_ORG}/cosmos-curator"
+        },
+        "resources": {
+            "requests": {
+                "nvidia.com/gpu": "${HELM_GPU_REQUESTS}"
+            },
+            "limits": {
+                "nvidia.com/gpu": "${HELM_GPU_LIMITS}"
+            }
+        },
+        "shmem": {
+            "limit": "${HELM_SHMEM_LIMIT}"
+        },
+        "extraEnv": {
+            "NVCF_DISABLE_PROXY_CACHE": "true"
+        },
+        "metrics": {
+          "remoteWrite": {
+            "endpoint": "${HELM_THANOS_RECEIVER_URL}"
+          },
+          "enabled": true,
+          "otlp": {
+            "enabled": true
+          }
+        },
+        "otlp": {
+          "endpoint": "${OTLP_ENDPOINT_URL}",
+          "extractNVCFSecrets": true,
+          "tls": {
+            "certPath": "/etc/curator-otlp/certs/tls.crt",
+            "keyPath": "/etc/curator-otlp/certs/tls.key",
+            "caPath": "/etc/curator-otlp/certs/ca.crt"
+          },
+          "nvcfSecrets": {
+            "secretName": "nvcf-secrets",
+            "certKey": "otlp-client-crt",
+            "keyKey": "otlp-client-key",
+            "caKey": "otlp-ca-crt"
+          }
+        },
+        "tracing": {
+          "otlp": {
+            "enabled": true
+          }
+        },
+        "logging": {
+          "format": "json",
+          "rayBackendJson": true,
+          "otlp": {
+            "enabled": true,
+            "includeMetricsExternalLabels": true,
+            "extraResourceAttributes": {
+              "deployment.environment": "cosmos-curate-ci"
+            },
+            "extraLabels": {
+              "k8s.cluster.name": "cosmos-curate-ci"
+            }
+          }
+        },
+        "networkPolicy": {
+          "enabled": false
+        },
+        "#commentScratch": "path to additional node storage on host",
+        "#scratchDir": "/scratch"
+    },
+    "#clusters": [
+        "cluster1"
+    ],
+    "#regions": [
+        "region1"
+    ],
+    "#attributes": [
+        "attr1"
+    ]
+}

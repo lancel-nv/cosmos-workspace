@@ -1,0 +1,18 @@
+# System trust store for HTTPS model clients. Regenerate with:
+#   dazel run @attribute_verification_packages//:lock
+version: 1
+
+sources:
+  - channel: jammy main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+  - channel: jammy-updates main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+  - channel: jammy-security main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+
+archs:
+  - "amd64"
+
+packages:
+  - "ca-certificates"
+  - "openssl"

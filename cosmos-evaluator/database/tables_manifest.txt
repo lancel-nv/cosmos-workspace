@@ -1,0 +1,4 @@
+# Schema files applied on every boot, in listed order, by tables_manifest.sh. Every entry must be re-appliable.
+# Entries are filenames relative to the schema directory (/etc/postgres-schemas).
+# Blank lines and lines starting with '#' are ignored.
+orchestration.sql

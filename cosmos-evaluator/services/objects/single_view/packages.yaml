@@ -1,0 +1,32 @@
+# System packages for the Objects Correspondence service container image.
+#
+# These packages are resolved at build time by rules_distroless and baked into the OCI image as a tar layer, eliminating
+# the need for apt-get at container startup.
+#
+# Source URLs use snapshot.ubuntu.com for reproducible builds. To update to newer packages, change the snapshot
+# timestamp in the source URLs below, then regenerate the lockfile:
+#
+#   dazel run @objects_packages//:lock
+#
+version: 1
+
+sources:
+  - channel: jammy main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+  - channel: jammy-updates main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+  - channel: jammy-security main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+
+archs:
+  - "amd64"
+
+packages:
+  - "gnupg2"  # Override base image version (2.2.27-3ubuntu2.1) with jammy-security patch (2.2.27-3ubuntu2.5)
+  - "libblas3"
+  - "liblapack3"
+  - "libxcb1"
+  # The CUDA base image freezes apt packages at CUDA release time and ships libssl3 3.0.2-0ubuntu1.18 / openssl
+  # 3.0.2-0ubuntu1.19; no CUDA 12.x tag ships the USN-8414-1 patch, so override both here (3.0.2-0ubuntu1.30).
+  - "libssl3"
+  - "openssl"

@@ -1,0 +1,225 @@
+metropolis.hallucination:
+  enabled: true
+  deps: []
+  blur_ksize: 7
+  dist_tol_px: 7.0
+  grad_thresh: 10.0
+  morph_k: 3
+  moving_window_size: 32
+  threshold: 0.682
+  # max_frames: 1000
+
+metropolis.physical_plausibility:
+  enabled: true
+  deps: []
+  cap: 0.3  # Validation good-rejection cap stored in the bundle.
+  checkpoint_uri: "hf://nvidia/physical-plausibility-evaluator@a427d8a37cba9200df31190a4130e60c209acd41/finevideo-attention-linear-v1/model.pt"
+  device: "cuda"
+  # bad_threshold: null  # defaults to the checkpoint threshold
+
+metropolis.attribute_verification:
+  enabled: true
+  deps: []
+  selected_variables:
+    weather: sunny
+    time_of_day: morning
+  variable_options:
+    weather:
+      - sunny
+      - cloudy
+      - rainy
+      - snowy
+    time_of_day:
+      - morning
+      - night
+  # Attribute names listed here are removed from both selected_variables and variable_options before questions run.
+  exclude_variables: []
+  # Optional fixed MCQs. Each entry accepts variable, value, question, options, correct_answer, and request_reasoning.
+  extra_questions: []
+  retries: 2
+  question_generation:
+    # Let the LLM invent distractors while keeping the configured selected value as the ground-truth answer.
+    generate_options: false
+    llm:
+      endpoint: "<your-llm-endpoint>"
+      model: "<your-llm-model>"
+    parameters:
+      frequency_penalty: 0.0
+      max_tokens: 2048
+      presence_penalty: 0.0
+      retry: 1
+      stream: true
+      temperature: 0.2
+      top_p: 0.95
+    system_prompt: "You are an expert at creating multiple choice verification questions.\
+      \ \nYour task is to generate a simple, direct question that can verify a specific\
+      \ attribute in a video frame.\nThe question must have 2-4 answer options and\
+      \ test for a specific visual attribute.\nThe question should be answerable by\
+      \ looking at a single frame from the video.\nOutput your response as a single\
+      \ JSON object with no additional text or formatting.\n"
+  vlm_verification:
+    # Sample this many evenly spaced frames from videos. Images are sent directly.
+    frames: 1
+    vlm:
+      endpoint: "<your-vlm-endpoint>"
+      model: "<your-vlm-model>"
+    parameters:
+      frequency_penalty: 0.0
+      max_tokens: 10
+      retry: 1
+      stream: false
+      temperature: 0.0
+      top_p: 1.0
+    system_prompt: 'You are an expert vision model tasked with answering multiple
+      choice questions about images.
+
+      Analyze the image carefully and select the single best answer from the provided
+      options.
+
+      Respond with ONLY a single letter (A, B, C, or D) corresponding to your answer.
+
+      Do not include any explanation or additional text.
+
+      '
+
+av.objects_single_view:
+  enabled: true
+  deps: []
+  # Opt-in debug dump of raw CWIP output + hallucination intermediates to <output_dir>/debug/. Off by default.
+  debug_dump: false
+  # Presence layer: how layer 0 of the class-mask tensors consumed by correspondence and hallucination is built. The
+  # block is validated on every processor construction, so a malformed block fails the job fast rather than silently
+  # taking no effect.
+  presence:
+    # Two-stream runs only; a camera-only run has no similarity head and always uses the type mask (results report
+    # presence_source: type).
+    #   similarity   - the similarity head's verdict: MATCH patches for correspondence, EXTRA for hallucination.
+    #   type         - the type-head mask below for both checks, as in a camera-only run.
+    #   union        - the similarity verdict OR the type-head mask (default).
+    #   intersection - the similarity verdict AND the type-head mask.
+    source: union
+    # The type-head presence mask, used by camera-only runs and by every two-stream source except similarity.
+    type_mask:
+      #   confidence - a patch is present when its top type-class probability is >= confidence_threshold.
+      #   argmax     - every patch is present; the class filter alone selects the queried type (threshold-free).
+      gate: confidence
+      # Global probability gate in [0, 1] for gate=confidence.
+      confidence_threshold: 0.5
+      # Optional per-class overrides of confidence_threshold, keyed by object class name (e.g. traffic_light: 0.6).
+      per_class_thresholds: {}
+    # Per-class hallucination-tracker overrides (min_cluster_area / min_track_frames), keyed by static object class
+    # name that has a hallucination_detector entry. Applied whenever the hallucination layer includes the type-head
+    # mask: camera-only, and two-stream type / union (similarity and intersection cannot add type-head-only patches);
+    # the shared hallucination_detector.classes knobs are untouched. The type-head mask over-produces small,
+    # short-lived clusters relative to the similarity mask. min_cluster_area is enforced in the hallucination detector,
+    # so clusters below it are never recorded: an offline sweep over recorded results.json can only raise the area
+    # above this floor, never probe lower (drop the override and re-run to tune below it). min_track_frames is applied
+    # after detection and stays fully sweepable in either direction.
+    hallucination_overrides:
+      # Tighten traffic-sign extra-object detection to raise precision: the type-head mask over-produces small
+      # single-frame false clusters that a 300px area floor and 5-frame persistence gate suppress at negligible recall
+      # cost.
+      traffic_sign:
+        min_cluster_area: 300
+        min_track_frames: 5
+  importance_filter:
+    allow_all_static_objects: true
+    distance_threshold_m: 100
+    relevant_lanes:
+      - ego
+      - left
+      - right
+    skip_oncoming_objects: false
+
+  overlap_check:
+    crosswalk:
+      method: ratio
+      min_projection_area: 200
+    lane_line:
+      method: spine
+      min_projection_area: 50
+      spine_match_tolerance_px: 0
+      spine_min_ribbon_width_px: 0
+    motorcycle:
+      method: cluster
+      bottom_occlusion_abstain_frac: 0.5
+      min_in_frame_fraction: 1.0
+    pedestrian:
+      method: cluster
+      bottom_occlusion_abstain_frac: 0.5
+      min_in_frame_fraction: 1.0
+    road_boundary:
+      method: spine
+      min_projection_area: 50
+      spine_match_tolerance_px: 0
+      spine_min_ribbon_width_px: 0
+    traffic_light:
+      method: ratio
+      min_projection_area: 200
+      # Existence is deliberately NOT gated: a partially clipped light can still be matched, and gating it
+      # would drop fully-truncated lights out of the in-FOV denominator rather than judging them.
+      min_in_frame_fraction: 0.0
+      state_min_in_frame_fraction: 1.0
+    # traffic_sign has no min_in_frame_fraction: the frame-edge gate is deliberately left off for signs until
+    # its effect on traffic lights has been measured.
+    traffic_sign:
+      method: ratio
+      min_projection_area: 300
+    vehicle:
+      method: ratio
+      bottom_occlusion_abstain_frac: 0.5
+      min_in_frame_fraction: 0.5
+    wait_line:
+      method: spine
+      min_projection_area: 50
+      spine_match_tolerance_px: 0
+      spine_min_ribbon_width_px: 0
+
+  hallucination_detector:
+    enabled: true
+    classes:
+      bicycle:
+        min_cluster_area: 2000
+      motorcycle:
+        min_cluster_area: 3000
+      pedestrian:
+        min_cluster_area: 1000
+      lane_line:
+        min_cluster_area: 16
+        # tracker: bev_ground groups detections by connectivity on the ground plane instead of by per-frame
+        # bounding-box overlap. A deleted line arrives as many small fragments whose boxes shift across the
+        # image as the ego drives, which overlap association cannot follow; in the world they do not move.
+        tracker: bev_ground
+        # Counted as DISTINCT frames, not a consecutive run (see confirm_hallucination_tracks): a world-space
+        # track is a physical thing and may pass behind a vehicle without ceasing to be itself. Measured on
+        # baseline clip bb4f394b, whose 21 lane-line tracks are all false positives with spans
+        # [44, 12, 5, 3, 3, 2, 2, 2, 2, 1 x 12]: a gate of 5 leaves 3. Chosen on false-positive suppression
+        # alone, with no true positive yet to trade against, so it is a starting point rather than a tuned one.
+        min_track_frames: 5
+      road_boundary:
+        # Boundaries are usually solid rather than dashed, so their components run larger.
+        min_cluster_area: 32
+        tracker: bev_ground
+        # Same gate as lane_line for consistency. Note it removes every road-boundary track on the measured
+        # clip (spans [4, 2, 2, 1 x 5]), so this class is currently gated to silence rather than tuned.
+        min_track_frames: 5
+      traffic_light:
+        min_cluster_area: 32
+        min_track_frames: 2
+        association_proximity_px: 30
+      traffic_sign:
+        min_cluster_area: 150
+      vehicle:
+        min_cluster_area: 5000
+    max_cluster_per_frame: 100
+    # Bird's-eye grid for tracker: bev_ground. 0.1 m/px resolves a lane marking; a 7 px stroke reaches ~0.3 m
+    # either side, bridging the gap between dashes of one line without reaching the next lane, ~3 m away.
+    # Replaced an equivalent-looking 3 px grid dilation when the grouping moved onto the shared
+    # polyline_grouping library. A stroke and a dilation do not cover identically: on clip bb4f394b lane lines
+    # come out the same (3 tracks, spans 44/12/5) while road boundaries merge slightly more, 29 groups -> 26,
+    # which leaves one boundary track surviving the persistence gate where previously none did.
+    bev_resolution_m: 0.1
+    bev_thickness_px: 7
+
+  visualization:
+    enabled: true

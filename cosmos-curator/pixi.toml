@@ -1,0 +1,439 @@
+[workspace]
+channels = ["rapidsai", "conda-forge"]
+conda-pypi-map = { conda-forge = "conda-pypi-map.json" }
+name = "cosmos-curator"
+platforms = [
+    "linux-64",
+    "linux-aarch64",
+    "osx-arm64",
+    { name = "linux-64-cuda", platform = "linux-64", cuda = "13.0.3", glibc = "2.35" },
+    { name = "linux-aarch64-cuda", platform = "linux-aarch64", cuda = "13.0.3", glibc = "2.35" },
+]
+version = "1.0.0"
+
+[activation.env]
+PYTHONNOUSERSITE = "1"  # isolate pixi environments from user/system site-packages
+
+[dependencies]
+python = "==3.13.18" # CVE remediation: 3.13.15 fixes CVE-2026-11940/11972/15308; 3.13.18 adds CVE-2026-115557/19445/19553/82049
+pip = "*"
+
+[feature.linux]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.core.dependencies]
+aiohttp = ">=3.14.4" # CVE remediation: 3.14.4 fixes CVE-2026-111064, CVE-2026-111066, GHSA-2g87-pp6c-29x5; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it; also keeps the conda solve compatible with ray[default] 2.60
+astral = "*"
+attrs = "*"
+azure-identity = "*"
+azure-storage-blob = "*"
+brotli-python = ">=1.2.1" # CVE remediation: 1.2.1 fixes CVE-2026-111497; conda name for pypi "brotli" (pulled in by urllib3's conda recipe); conda dep so the conda solve doesn't pin a lower version out from under it
+cattrs = "*"
+certifi = ">=2026.10.18" # CVE remediation: 2026.10.18 fixes GHSA-6q48-6c7w-9gw2; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
+dnspython = ">=2.9.0" # CVE remediation: 2.9.0 fixes CVE-2026-114605; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
+easydict = "*"
+fastapi = ">=0.115,<0.137" # NVCF imports FastAPI directly; vLLM requires fastapi[standard]<0.137
+huggingface_hub = "*"
+jinja2 = "*"
+loguru = "*"
+mcap = ">=1.3.1,<2.0.0"
+multidict = ">=6.6.3,<7" # mirror pyproject.toml's own pin (line 37) into the conda solve
+numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
+nvidia-ml-py = "*"
+nvtx = "==0.2.15" # match vLLM's NVTX requirement
+openssl = ">=3.6.5,<4.0a0" # default env: bin/openssl; 3.6.5 fixes CVE-2026-84782, CVE-2026-84784, CVE-2026-72897, CVE-2026-54873; stay on 3.x
+pandas = "*"
+pyarrow = ">=23.0.1" # CVE-2026-25087: require patched Arrow floor
+pydantic = ">=2.12,<3"
+pyproj = "*"
+pyjwt = ">=2.14.0" # CVE remediation: 2.14.0 fixes CVE-2026-102266/102267/102268/102271/102272/102273
+pytest = "*"
+pytest-asyncio = "*"
+pytest-cov = "*"
+pytest-xdist = "*"
+scipy = "*"
+setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
+starlette = ">=1.3.1,<2" # CVE-2026-54283; Ray Serve imports starlette during broad GPU test collection
+tabulate = "*"
+tblib = "*"
+tenacity = "*"
+timezonefinder = "*"
+tqdm = "*"
+typer = ">=0.21.0"
+urllib3 = ">=2.8.0" # CVE remediation: 2.8.0 fixes CVE-2026-97687, CVE-2026-97689; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
+uvicorn = "*"
+virtualenv = ">=21.14.9" # CVE remediation: highest floor needed across CVE-2026-102925/102930/102937/113718/113722/113723/113725/113726/113732/113776; conda dep (not pypi) so the conda solve doesn't pin a lower version out from under it
+websockets = "<16" # google-genai requires websockets<16
+
+[feature.core.pypi-dependencies]
+cosmos-xenna = "==0.6.0"
+foxglove-schemas-protobuf = "*"
+google-genai = ">=1.59.0" # conda-forge package is too old
+grpcio-reflection = "*" # vLLM metrics import ray.serve, which requires gRPC reflection in Ray 2.60
+msgpack = ">=1.2.3" # CVE remediation: 1.2.3 fixes CVE-2026-114613 (no conda-forge build; pypi-only dep)
+ngcsdk = "*" # not available on conda-forge
+pillow = ">=12.2.0"  # CVE-2026-40192: patched in Pillow 12.2.0+ (core PyPI dep)
+pyasn1 = ">=0.6.5" # CVE remediation: 0.6.5 fixes CVE-2026-119194/119195/119196/119197
+pybase64 = ">=1.5.0" # SIMD base64 for bulk per-row data-URL encode; matches the version vllm already pins
+pylance = ">=14.0.2,<15.0.0" # conda-forge package is too old
+pulp = "*" # conda-forge package is too old
+ray = { version = "==2.60.0", extras = ["default", "data"] } # conda-forge package pulls in an old version of protobuf
+webdataset = "*" # conda-forge package pulls in pytorch
+
+[feature.core.tasks]
+hello-world = "python -m cosmos_curator.pipelines.examples.hello_world_pipeline"
+model-download = "python -m cosmos_curator.core.managers.model_cli download"
+# COSMOS_CURATOR_CODE_DIR points all_models.json lookup at this checkout; without it these
+# resolve to the in-container /opt/cosmos-curator, which does not exist on a dev machine.
+model-checksums = { cmd = "python -m cosmos_curator.core.managers.model_cli checksums", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
+model-verify-ngc = { cmd = "python -m cosmos_curator.core.managers.model_cli verify-ngc", env = { COSMOS_CURATOR_CODE_DIR = "$PIXI_PROJECT_ROOT" } }
+run-pipeline = "python -m cosmos_curator.pipelines.pipeline_runtime"
+video-pipeline = "python -m cosmos_curator.pipelines.video.run_pipeline"
+gpu-test = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"
+integration-test = "pytest -m integration tests/cosmos_curator/pipelines tests/cosmos_curator/models tests/cosmos_curator/next"
+
+[feature.tools]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[feature.tools.dependencies]
+aiohttp = ">=3.14.4" # CVE remediation: 3.14.4 fixes CVE-2026-111064, CVE-2026-111066, GHSA-2g87-pp6c-29x5; same floor as core, tools/cluster don't pull in core
+certifi = ">=2026.10.18" # CVE remediation: 2026.10.18 fixes GHSA-6q48-6c7w-9gw2; same floor as core, tools/cluster don't pull in core
+multidict = ">=6.6.3,<7" # mirror pyproject.toml's own pin (line 37) into the conda solve; tools/cluster don't pull in core
+openssl = ">=3.6.5,<4.0a0" # CVE remediation: same floor as core; tools/cluster don't pull in core
+pre-commit = "==4.2.0"
+pydantic = ">=2.12,<3"
+python-build = "*"
+setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
+setuptools-scm = ">=8"
+urllib3 = ">=2.8.0" # CVE remediation: 2.8.0 fixes CVE-2026-97687, CVE-2026-97689; same floor as core, tools/cluster don't pull in core
+virtualenv = ">=21.14.9" # CVE remediation: highest floor needed across CVE-2026-102925/102930/102937/113718/113722/113723/113725/113726/113732/113776; same floor as core, tools/cluster don't pull in core
+
+[feature.tools.pypi-dependencies]
+cosmos-curator = { path = ".", editable = true }
+ruff = "==0.15.15"
+
+[feature.tools.tasks]
+build = "python -m build"
+cosmos-curator = "python -m cosmos_curator.client.cli"
+pre-commit = "pre-commit"
+ruff = "ruff"
+
+[feature.cluster]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.cluster.dependencies]
+nvitop = "*"
+nvtop = "*"
+
+[feature.cluster.pypi-dependencies]
+awscli = "*"
+awscli-plugin-endpoint = "*"
+pyasn1 = ">=0.6.5" # CVE remediation: 0.6.5 fixes CVE-2026-119194/119195/119196/119197; pulled in by awscli, same floor as core
+
+[feature.cluster.tasks]
+nvitop = "nvitop"
+nvtop = "nvtop"
+
+[feature.dev]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.dev.dependencies]
+gpustat = "*"
+multidict = ">=6.6.3,<7" # keep the conda solve compatible with the deployment client's pyproject.toml constraint
+pytest-mock = "*"
+safetensors = "*"
+
+[feature.dev.pypi-dependencies]
+matplotlib = "*"
+mypy = "==2.1.0"
+openai = "*"
+pandas-stubs = "*"
+torch = "==2.14.0" # match the default environment's vLLM-pinned torch
+torchvision = "==0.29.0"
+twine = "==6.1.0"
+types-aiofiles = "*"
+types-boto3 = "*"
+types-psutil = "*"
+types-pyyaml = "*"
+types-requests = "*"
+types-six = "*"
+types-tabulate = "*"
+types-toml = "*"
+types-tqdm = "*"
+
+[feature.dev.tasks]
+mypy = "mypy"
+# Use suite names so pytest remains available as an executable in other environments.
+unit-test = "python -m pytest"
+# memory-bound suite; 4 workers measured optimal in CI — don't crank on a busy workstation
+unit-test-fast = "python -m pytest -n 4 --dist loadfile"
+
+[feature.runtime]
+channels = ["conda-forge", "nvidia"]
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
+
+[feature.runtime.dependencies]
+cuda-libraries-dev = "==13.0.3"
+gpustat = "*"
+huggingface_hub = ">=1.31.0" # vLLM requires this floor; keep the conda solve compatible
+libgl = "*" # PaddleOCR/OpenCV image paths need libGL.so.1
+pycountry = "*"
+
+[feature.runtime.pypi-dependencies]
+cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (default env; fixes vs vulnerable 5.8.x)
+cvcuda-cu13 = "*" # not available on conda-forge
+# Keep CUDA Python tooling aligned with torch's cuda-toolkit==13.0.3.
+cuda-bindings = "==13.0.*"
+cuda-python = "==13.0.*"
+nvidia-cuda-cccl = "==13.0.*"
+nvidia-cuda-crt = "==13.0.*"
+PyNvVideoCodec = ">=2.0.4" # not available on conda-forge. Floor only: vLLM pins ==2.0.4 (through 0.33.0), so vLLM envs resolve to 2.0.4; no upper bound so anything without that pin, and future vLLM releases, pick up newer versions. NVIDIA versions are not date-ordered (2.1.0 predates 2.0.4).
+timm = "*" # conda-forge package pulls in torchvision, which is behind; torch is pinned by vllm/vllm-omni
+paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
+paddleocr = "==2.10.*"
+
+[feature.runtime.target.linux-aarch64.dependencies]
+# Add CUDA toolchain packages on aarch64 -- these are automatic dependencies on linux-64.
+cuda-nvvm-tools = "13.0.*"
+cuda-nvcc-tools = "13.0.*"
+cuda-nvrtc = "13.0.*"
+cuda-nvrtc-dev = "13.0.*"
+cuda-nvrtc-static = "13.0.*"
+cuda-cupti = "13.0.*"
+cuda-cuobjdump = "13.0.*"
+cuda-nvdisasm = "13.0.*"
+
+[feature.runtime.target.linux-aarch64.pypi-dependencies]
+# Add available NVIDIA CUDA runtime wheels for aarch64 to match linux-64 installs.
+# With CUDA 13, most nvidia-*-cu13 PyPI packages are deprecated stubs that fail to build.
+# Use unsuffixed names (e.g. nvidia-cublas) for those; keep -cu13 only where real wheels exist.
+nvidia-cublas = "*"
+nvidia-cuda-cupti = "*"
+nvidia-cuda-nvrtc = "*"
+nvidia-cuda-runtime = "*"
+nvidia-cudnn-cu13 = "*"
+nvidia-cufft = "*"
+nvidia-curand = "*"
+nvidia-cusolver = "*"
+nvidia-cusparse = "*"
+nvidia-cusparselt-cu13 = "*"
+nvidia-cufile = "*"
+nvidia-nccl-cu13 = "*"
+nvidia-nvjitlink = "*"
+nvidia-nvshmem-cu13 = "*"
+nvidia-nvtx = "*"
+
+# Regular inference can upgrade vLLM independently of the Omni-compatible pair, so each
+# feature pins the torch stack its vLLM release requires instead of the shared runtime feature.
+[feature.vllm.dependencies]
+transformers = ">=5.16.1,<5.21.0" # keep the conda solve within vLLM's supported range
+
+# Ray 2.60.0's ray.data.llm multimodal stage imports vLLM's chat utilities from their
+# pre-0.32 path; cosmos_curator/next/core/ray_llm_compat.py bridges it until Ray catches up.
+[feature.vllm.pypi-dependencies]
+torch = "==2.14.0" # vLLM 0.33.0 requires torch==2.14.0
+torchvision = "==0.29.0"
+vllm = "==0.33.0" # not available on conda-forge
+
+# Cosmos3 Generator Transfer runs in-process through vLLM-Omni's offline `Omni`
+# API. Keep it out of the shared runtime feature: its large, transfer-specific
+# dependency tree (including openai-whisper) is needed only by StyleTransferStage.
+# Pin its matching vLLM here so regular inference upgrades do not change this pair.
+[feature.vllm-omni.dependencies]
+transformers = ">=5.16.1,<5.20.0" # keep the conda solve within Omni's supported range
+
+[feature.vllm-omni.target.linux-aarch64.dependencies]
+# conda-forge has no CUDA 13.0 build of triton 3.8, so torch 2.14 in the vllm feature takes
+# triton from PyPI; keep this pair's conda triton until Omni moves to torch 2.14.
+triton = "==3.7.1" # torch 2.13 requires triton==3.7.1
+
+[feature.vllm-omni.pypi-dependencies]
+torch = "==2.13.0" # vLLM 0.32.0 requires torch==2.13.0
+torchvision = "==0.28.0"
+vllm = "==0.32.0" # keep paired with the Omni release
+vllm-omni = "==0.32.0" # not available on conda-forge
+
+[feature.cuml]
+channels = ["nvidia"]
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
+
+[feature.cuml.dependencies]
+azure-identity = "*"
+azure-storage-blob = "*"
+cuml = "==26.04" # Required for pyarrow>=23.0.1; RAPIDS 26.02 constrains pyarrow<22
+# RAPIDS constrains CUDA broadly; keep its CUDA stack on the 13.0 line.
+cuda-bindings = "13.0.*"
+cuda-python = "13.0.*"
+cuda-version = "13.0.*"
+loguru = "*"
+numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
+openssl = ">=3.6.5,<4.0a0" # cuml env: bin/openssl; 3.6.5 fixes CVE-2026-84782, CVE-2026-84784, CVE-2026-72897, CVE-2026-54873; stay on 3.x
+pillow = ">=12.2.0" # CVE-2026-40192: same floor as core; cuml omits core so pin conda pillow (RAPIDS pulls it), not only core's pypi-dep
+pyjwt = ">=2.14.0" # CVE remediation: 2.14.0 fixes CVE-2026-102266/102267/102268/102271/102272/102273 (cuml env; same floor as core)
+msgpack-python = ">=1.2.3" # CVE remediation: 1.2.3 fixes CVE-2026-114613; conda name differs from the pypi "msgpack" dep in core.pypi-dependencies, and distributed/rapids-dask-dependency pull the conda build in here, so it needs its own conda-side floor
+raft-dask = "*"
+setuptools = "<81" # prettytable 2.0 (via ngcsdk) requires pkg_resources, removed in setuptools 81
+tornado = ">=6.5.9" # CVE remediation: 6.5.9 fixes GHSA-c2m8-h5v5-343r, GHSA-chx6-46f5-w4vp (cuml env)
+tqdm = "*"
+
+[feature.cuml.pypi-dependencies]
+ngcsdk = "*" # not available on conda-forge
+pyasn1 = ">=0.6.5" # CVE remediation: 0.6.5 fixes CVE-2026-119194/119195/119196/119197 (cuml env; same floor as core)
+pylance = ">=14.0.2,<15.0.0" # conda-forge package is too old
+
+[feature.transformers.dependencies]
+transformers = ">=5.11.0,<6.0.0" # native Cosmos3 support requires recent Transformers v5
+
+[feature.transformers.pypi-dependencies]
+# sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.
+cuda-bindings = "==13.0.*"
+nltk = ">=3.10.4" # CVE remediation: 3.10.4 fixes CVE-2026-81726, GHSA-j456-xh4h-cpf2 (pulled in transitively via cosmos_guardrail; only style-transfer resolves nltk today, but its unconditional deps are already pulled in elsewhere so this adds no real footprint to default/seedvr)
+sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch
+
+# SeedVR2 super-resolution dependencies.
+# SeedVR's own requirements.txt pins old versions (e.g. diffusers==0.29.1,
+# transformers==4.38.2) but the inference code works fine with newer releases.
+# We use unpinned versions to avoid conflicts with other environments.
+[feature.seedvr.dependencies]
+cuda-libraries-dev = "==13.0.3"
+einops = "*"
+omegaconf = "*"
+
+[feature.seedvr.pypi-dependencies]
+diffusers = "*"
+mediapy = "*" # SeedVR uses mediapy.write_image / write_video for super-resolution output and shells out to ffmpeg on PATH.
+rotary-embedding-torch = "*"
+
+[feature.media]
+channels = ["conda-forge"]
+
+[feature.media.dependencies]
+av = "==17.0.0" # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix).
+ffmpeg = { version = "==8.1.2", build = "lgpl_*" }
+libopencv = { version = "*", build = "headless_*" }
+opencv = { version = "*", build = "headless_*" }
+py-opencv = { version = "*", build = "headless_*" }
+
+[feature.legacy-transformers]
+# NVDEC's aarch64 wheel requires glibc >= 2.34.
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
+
+[feature.legacy-transformers.dependencies]
+einops = "*"
+transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require older transformers
+
+[feature.legacy-transformers.pypi-dependencies]
+# Legacy models pull torch directly; keep torch's CUDA bindings on the 13.0 line.
+cuda-bindings = "==13.0.*"
+PyNvVideoCodec = ">=2.2.4" # video-embed keeps decode, preprocessing, and inference on the GPU; no vLLM in this env so it is free of vLLM's ==2.0.4 pin; floor only
+timm = "*" # conda-forge package pulls in torchvision, which is behind
+torch = "==2.11.0"
+torchvision = "==0.26.0"
+
+# PaddleOCR for artificial text (overlay/post-production) detection. Isolated from default's vllm dependencies.
+[feature.paddle-ocr.target.linux-64.dependencies]
+libgl = "*" # paddleocr -> opencv-python needs libGL.so.1
+
+[feature.paddle-ocr.target.linux-64.pypi-dependencies]
+paddleocr = "*"
+
+
+# Distributed tracing (OpenTelemetry).
+# Included in ALL environments because the Ray tracing hook
+# (tracing_hook.py:setup_tracing) runs on every worker, regardless
+# of which Pixi env it is assigned to.
+[feature.tracing.dependencies]
+importlib-metadata = "<8.8.0"  # recent opentelemetry-api versions (after ~1.27) require importlib-metadata<8.8.0; conda-forge now ships 8.8.0
+
+[feature.tracing.pypi-dependencies]
+# Lightweight -- pure-Python wheels only.
+opentelemetry-api = ">=1.20"
+opentelemetry-sdk = ">=1.20"
+opentelemetry-exporter-otlp-proto-http = ">=1.20"
+opentelemetry-instrumentation-botocore = ">=0.44b0"
+opentelemetry-instrumentation-requests = ">=0.44b0"
+opentelemetry-instrumentation-urllib3 = ">=0.44b0"
+opentelemetry-instrumentation-threading = ">=0.44b0"
+opentelemetry-instrumentation-logging = ">=0.44b0"
+opentelemetry-instrumentation-fastapi = ">=0.44b0"
+# Used by metrics_push to parse Ray's Prometheus text exposition.
+# Already pulled in transitively by Ray; promoted to a first-party
+# dep so the in-pipeline scraper does not rely on a transitive path.
+prometheus-client = ">=0.21.1"
+wrapt = ">=1.14"
+
+# Stage instrumentation backends (CPU profiling, memory profiling).
+# Included in environments that run pipeline stages.
+[feature.profiling.pypi-dependencies]
+pyinstrument = ">=5.0"
+memray = ">=1.14"
+
+[feature.sam3.pypi-dependencies]
+# SAM3 (Segment Anything 3) carries its own kernels dependency, so keep it in a
+# dedicated environment even though the main transformers feature now uses v5.
+# Pin kernels <0.15: kernels 0.15 made version/revision mandatory on
+# LayerRepository, but transformers' integrations/hub_kernels.py still builds one
+# without either, so importing the SAM3 model modules (modeling_sam3 -> CLIP ->
+# transformers.activations -> hub_kernels) raises "Either a revision or a version
+# must be specified." 0.14.1 is the standard fix (HF transformers#46291).
+kernels = "==0.14.1"
+transformers = ">=5.6.0,<6.0.0"
+
+# The Ray-free single-session data-integrity tool (`di`), paired with `media` for PyAV.
+#
+# Its own dependency table rather than a slice of `core`, which is what a thin environment
+# would normally be built from, because `core` cannot be installed on a laptop at all:
+# cosmos-xenna publishes no osx-arm64 wheel and its Rust build fails there, and
+# conda-forge's nvtx is Linux-only. Neither is reachable from this tool -- it imports no
+# Ray and no Xenna, by design -- so what is listed here is its actual import closure
+# instead, which is short enough to keep honest. Note that this duplicates no *policy*:
+# every threshold, input and credential still comes from the one shared config model, and
+# that is the duplication worth avoiding.
+[feature.di]
+channels = ["conda-forge"]
+
+[feature.di.dependencies]
+attrs = "*"
+azure-identity = "*"
+azure-storage-blob = "*"
+boto3 = "*"
+loguru = "*"
+numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
+pyarrow = ">=23.0.1" # CVE-2026-25087: require patched Arrow floor
+pydantic = ">=2.12,<3"
+pyyaml = "*"
+smart_open = "*"
+tqdm = "*"
+
+[feature.di.pypi-dependencies]
+pylance = ">=14.0.2,<15.0.0" # conda-forge package is too old; keep in step with `core`
+
+[feature.di.tasks]
+# Run from the project root, which is where pixi puts you: `python -m` adds the working
+# directory to sys.path, so the checkout is importable without an editable install (the
+# same mechanism `unit-test` and `run-pipeline` rely on).
+di = "python -m cosmos_curator.next.recipes.data_integrity.session_cli"
+
+[feature.sensors.pypi-dependencies]
+hydra4 = "==0.2.0" # Hesai Pandar UDP decoder; alpha upstream, pin exactly
+pypcd4 = "*" # direct import in hesai_lidar_parser; declare, don't inherit
+
+[environments]
+tools = ["tools"]
+cluster = ["tools", "cluster"]
+cuml = ["core", "cuml", "tracing"]
+default = ["core", "runtime", "vllm", "media", "transformers", "tracing", "profiling", "sensors"]
+dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev", "sensors"]
+# The only environment that decodes video and still solves for osx-arm64, which is the
+# point of it: a tool whose reason to exist is iterating on a scan without a cluster is
+# not much use if it only installs where a cluster would run.
+di = ["di", "media"]
+legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
+model-download = ["linux", "core", "tracing"]
+paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
+seedvr = ["core", "runtime", "vllm", "media", "transformers", "seedvr", "tracing", "profiling"]
+sam3 = ["core", "runtime", "vllm", "media", "sam3", "tracing", "profiling"]
+style-transfer = ["core", "runtime", "media", "transformers", "vllm-omni", "tracing", "profiling"]

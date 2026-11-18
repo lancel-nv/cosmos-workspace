@@ -1,0 +1,296 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Bazel module definition for Cosmos Evaluator.
+module(
+    name = "cosmos_eval",
+    version = "1.0",
+)
+
+bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")  # Tar/mtree utilities for OCI image layer splitting
+bazel_dep(name = "aspect_rules_lint", version = "2.6.0")  # Formatting/linting rules (v2.7.x has a bug in Ruff aspect)
+bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.2")  # Buildifier for formatting Bazel files
+bazel_dep(name = "gazelle", version = "0.47.0", repo_name = "bazel_gazelle")
+bazel_dep(name = "rules_python_gazelle_plugin", version = "2.0.3")
+bazel_dep(name = "platforms", version = "1.0.0")  # @platforms//os constraints (target_compatible_with on vendored wheel)
+bazel_dep(name = "rules_distroless", version = "0.8.0")  # Bazel-native Debian package management for OCI images
+bazel_dep(name = "rules_multirun", version = "0.14.0")  # Multirun for running targets concurrently
+bazel_dep(name = "rules_mypy", version = "0.41.0")  # Mypy for type checking
+bazel_dep(name = "rules_oci", version = "2.3.0")  # Open Containers Initiative rules
+bazel_dep(name = "rules_pkg", version = "1.2.0")  # For creating tar archives
+bazel_dep(name = "rules_python", version = "2.0.3")  # Python rules for building and testing
+bazel_dep(name = "rules_shell", version = "0.8.0")  # Shell rules for building and testing
+
+# Python toolchain.
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    configure_coverage_tool = True,
+    python_version = "3.13",
+)
+
+# Pin the 3.13 line to CPython 3.13.16. rules_python resolves 3.13 to 3.13.13, which lacks the fixes for CVE-2026-6100
+# (use-after-free in the lzma/bz2/zlib decompressors under memory pressure), CVE-2026-11940 and CVE-2026-82049 (link
+# bypasses of tarfile's data/tar extraction filters), CVE-2026-11972 (unbounded seeking in streaming-mode tarfile),
+# CVE-2026-19445 (ssl crash when an SNI callback switches contexts) and CVE-2026-15806 (urllib.request credentials
+# shared across URL schemes). Its bundled runtime manifest has no 3.13 build newer than 3.13.13, so the URLs and digests
+# below are stated explicitly and point at the 20261003 python-build-standalone release. single_version_override
+# registers 3.13.16 and the minor_mapping override repoints every `python_version = "3.13"` reference (toolchain,
+# pip.parse) at it. The SHA256s are those of the `install_only` (non-stripped) tarballs, the variant rules_python's
+# get_release_info selects (build=install_only, ext=tar.gz) for these platforms.
+# TODO(kudesai): Drop both blocks once a rules_python release maps 3.13 to >= 3.13.16 on its own.
+python.single_version_override(
+    python_version = "3.13.16",
+    sha256 = {
+        "aarch64-apple-darwin": "d8975d7df4f08f7b1c7aafcdfacbddcec3d366415f2c1a72b2466b6850815933",
+        "aarch64-unknown-linux-gnu": "6477121f22904963a066ac8ff89983baae781510815590e894daa3c11ce86652",
+        "x86_64-apple-darwin": "8e9cb087305bfb8969f68a905f79f41469d4aa5220c1aa71ada7fc9953bdba0f",
+        "x86_64-unknown-linux-gnu": "0a0272910b10417c659a9312fb3f2d7a6d774da7bd510999be7a3ba83273dc1f",
+    },
+    urls = ["20261003/cpython-{python_version}+20261003-{platform}-{build}.{ext}"],
+)
+python.override(
+    minor_mapping = {"3.13": "3.13.16"},
+)
+
+# Python pip extension for resolving requirements.txt from requirements.in.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+use_repo(pip, "pypi")
+
+# Dev-tagged extension for resolving requirements.txt from requirements.in in consumer modules
+pip_dev = use_extension("@rules_python//python/extensions:pip.bzl", "pip", dev_dependency = True)
+pip_dev.parse(
+    timeout = 1800,  # 30 minutes
+    # Register the PyTorch cu128 index with the bzlmod SimpleAPI resolver so it can match the +cu128 wheel hashes
+    # in requirements.txt. Without this, rules_python only queries pypi.org/simple and warns on every cu128 hash.
+    experimental_extra_index_urls = ["https://download.pytorch.org/whl/cu128"],
+    extra_pip_args = [
+        "--retries=3",
+        "--extra-index-url=https://download.pytorch.org/whl/cu128",
+    ],
+    hub_name = "pypi",
+    python_version = "3.13",
+    requirements_lock = "//:requirements.txt",
+)
+
+# Improve mypy's type checking with available type stubs.
+types = use_extension("@rules_mypy//mypy:types.bzl", "types")
+use_repo(types, "pip_types")
+
+# Dev-tagged extension for resolving requirements.txt from requirements.in in consumer modules
+types_dev = use_extension("@rules_mypy//mypy:types.bzl", "types", dev_dependency = True)
+types_dev.requirements(
+    name = "pip_types",
+    pip_requirements = "@pypi//:requirements.bzl",
+    requirements_txt = "//:requirements.txt",
+)
+
+# Custom http_archive extension. Wraps Bazel's stock http_archive with three extra capabilities: the netrc attribute is
+# resolved at fetch time, expanding `~` to the user's home directory (needed for archives whose download URL requires
+# netrc-based auth from a credentials file under $HOME); `patches` fixes up the extracted tree in place; and the
+# `dist_info_*` attributes synthesize a Python `.dist-info` directory so the vendored subset carries a name, version,
+# and license that `importlib.metadata` and SBOM scanners can both read. Consumer modules that want to add their own
+# archives can `use_extension("//third_party:http_archive.bzl", "http_archive")` and contribute their own
+# `http_archive.archive(...)` tags; bzlmod merges all tags into a single extension run.
+http_archive = use_extension("//third_party:http_archive.bzl", "http_archive")
+http_archive.archive(
+    name = "cosmos_drive_dreams_toolkits",
+    add_prefix = "third_party/cosmos_drive_dreams_toolkits",
+    build_file = "//third_party/cosmos_drive_dreams_toolkits:BUILD.cosmos_drive_dreams_toolkits",
+    dist_info_homepage = "https://github.com/nv-tlabs/Cosmos-Drive-Dreams",
+    dist_info_license = "Apache-2.0",
+    dist_info_license_files = ["//third_party/cosmos_drive_dreams_toolkits:LICENSE"],
+    dist_info_name = "cosmos-drive-dreams-toolkits",
+    dist_info_root = "third_party/cosmos_drive_dreams_toolkits",
+    dist_info_summary = "Camera models and geometry utilities from the Cosmos-Drive-Dreams toolkits",
+    dist_info_version = "0+908ba8f6",
+    integrity = "sha256-FpKCpKK8jgxkocXZQCF1q7oSKcS1JqmacmY5dAGShZQ=",
+    strip_prefix = "Cosmos-Drive-Dreams-908ba8f65463a222e46127222d669e40b778986d/cosmos-drive-dreams-toolkits",
+    url = "https://github.com/nv-tlabs/Cosmos-Drive-Dreams/archive/908ba8f65463a222e46127222d669e40b778986d.zip",
+)
+http_archive.archive(
+    name = "detectron2",
+    add_prefix = "third_party/detectron2",
+    build_file = "//third_party/detectron2:BUILD.detectron2",
+    dist_info_homepage = "https://github.com/facebookresearch/detectron2",
+    dist_info_license = "Apache-2.0",
+    dist_info_license_files = ["//third_party/detectron2:LICENSE"],
+    dist_info_name = "detectron2",
+    dist_info_root = "third_party",
+    dist_info_summary = "Lazy/instantiate config helpers and file_io + registry utilities from Detectron2",
+    dist_info_version = "0.6+a1ce2f95",
+    integrity = "sha256-/XHLB2/1MTPjgk0c/PwSzWR4TT1rFBPRURBdQG9+Z2I=",
+    strip_prefix = "detectron2-a1ce2f956a1d2212ad672e3c47d53405c2fe4312/detectron2",
+    url = "https://github.com/facebookresearch/detectron2/archive/a1ce2f956a1d2212ad672e3c47d53405c2fe4312.zip",
+)
+http_archive.archive(
+    name = "perception_models",
+    add_prefix = "third_party/perception_models/core/vision_encoder",
+    build_file = "//third_party/perception_models:BUILD.perception_models",
+    dist_info_homepage = "https://github.com/facebookresearch/perception_models",
+    dist_info_license = "Apache-2.0",
+    dist_info_license_files = ["//third_party/perception_models:LICENSE"],
+    dist_info_name = "perception-models",
+    dist_info_root = "third_party/perception_models",
+    dist_info_summary = "Perception Encoder vision encoder (core/vision_encoder) used by the CWIP model",
+    dist_info_version = "1.0.0+430a0121",
+    integrity = "sha256-wSU5jokSdGekgFNKrND5KhKYd/60gBuXoaQwRTvmvM0=",
+    patches = ["//third_party/perception_models:perception_models_rope2d_grid_guard.patch"],
+    strip_prefix = "perception_models-430a0121bd30e92df635bd59f724b2c52aa5bdd7/core/vision_encoder",
+    url = "https://github.com/facebookresearch/perception_models/archive/430a0121bd30e92df635bd59f724b2c52aa5bdd7.zip",
+)
+use_repo(
+    http_archive,
+    "cosmos_drive_dreams_toolkits",
+    "detectron2",
+    "perception_models",
+)
+
+# Custom local_wheel extension. Extracts a committed local wheel (tracked via Git LFS) into its own repo and overlays
+# a hand-written BUILD file — the wheel analog of the http_archive extension above. Used to vendor a custom-built
+# opencv-python-headless wheel compiled WITH_FFMPEG=OFF (strict LGPL: no bundled FFmpeg) and WITH_IPP=OFF (no Intel IPP,
+# whose license is not open source) that cannot come from PyPI.
+# See third_party/local_wheel.bzl, third_party/opencv/build_wheel.sh, and third_party/opencv/BUILD.opencv.
+local_wheel = use_extension("//third_party:local_wheel.bzl", "local_wheel")
+local_wheel.wheel(
+    name = "opencv_python_headless",
+    src = "//third_party/opencv:opencv_python_headless-4.13.0.92+noffmpeg.noipp-cp313-cp313-manylinux_2_28_x86_64.whl",
+    build_file = "//third_party/opencv:BUILD.opencv",
+)
+use_repo(local_wheel, "opencv_python_headless")
+
+### Base Images for Microservices ###
+# Below images are available for use as the base image for microservices. Choose the image that meets the minimum
+# requirements for the microservice.
+
+# Standard Ubuntu 22.04 (jammy) base image
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "ubuntu_22_04_image",
+    digest = "sha256:55caea0b2381efa9f672e20fc3e19b42bb74a86814e9c3ea25c7043d21428aec",
+    image = "nvcr.io/nvidia/base/ubuntu:jammy-20260810",
+    platforms = ["linux/amd64"],
+)
+
+# CUDA CUDNN base image (for GPU microservices, e.g. objects/single_view)
+oci.pull(
+    name = "cuda_cudnn_image",
+    digest = "sha256:59e0e4376a0f16d10b03d3a14344b80a866a1674cb4948cb318291387ac05010",
+    image = "nvcr.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04",
+    platforms = ["linux/amd64"],
+)
+use_repo(
+    oci,
+    "cuda_cudnn_image",
+    "cuda_cudnn_image_linux_amd64",
+    "ubuntu_22_04_image",
+    "ubuntu_22_04_image_linux_amd64",
+)
+
+### Images for Tests ###
+# Ryuk, the reaper container testcontainers starts to remove a test session's containers once the session ends. Tests
+# load it from runfiles under testcontainers' default tag, so the library finds it locally and never pulls it. Tracks
+# testcontainers/ryuk at the version the pinned testcontainers release requests. Fetched through Google's Docker Hub
+# mirror, which serves cached images anonymously without Docker Hub's unauthenticated pull-rate limit.
+oci.pull(
+    name = "ryuk_image",
+    digest = "sha256:bf3f74a47dee0acda89aba4b2fc9c7fdcf994a084db02a2d06566f07baae022e",
+    image = "mirror.gcr.io/testcontainers/ryuk:0.8.1",
+    platforms = ["linux/amd64"],
+)
+use_repo(
+    oci,
+    "ryuk_image",
+    "ryuk_image_linux_amd64",
+)
+
+### Debian Package Layers for Microservice Images ###
+# Resolves and downloads .deb packages at build time, producing tar layers that are added to OCI images via rules_oci.
+apt = use_extension("@rules_distroless//apt:extensions.bzl", "apt")
+apt.install(
+    name = "objects_packages",
+    lock = "//services/objects/single_view:packages.lock.json",
+    manifest = "//services/objects/single_view:packages.yaml",
+    mergedusr = True,
+)
+use_repo(apt, "objects_packages")
+
+apt.install(
+    name = "physical_plausibility_packages",
+    lock = "//services/physical_plausibility:packages.lock.json",
+    manifest = "//services/physical_plausibility:packages.yaml",
+    mergedusr = True,
+)
+use_repo(apt, "physical_plausibility_packages")
+
+apt.install(
+    name = "attribute_verification_packages",
+    lock = "//services/attribute_verification:packages.lock.json",
+    manifest = "//services/attribute_verification:packages.yaml",
+    mergedusr = True,
+    resolve_transitive = True,
+)
+use_repo(apt, "attribute_verification_packages")
+
+### Pre-downloaded .deb packages for GPU microservice images ###
+# These packages come from NVIDIA's flat apt repo which rules_distroless cannot resolve. Pre-downloading the .deb files
+# eliminates the need for apt-get update/install at container startup, saving ~2 minutes of network I/O per launch.
+# They are bundled into the //services:cuda_debs_layer tar and installed via dpkg -i in each GPU image's startup script.
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_file(
+    name = "cuda_cupti_12_8_deb",
+    downloaded_file_path = "cuda-cupti-12-8.deb",
+    sha256 = "cc73a4e090945b020fb0caa65830b9d12421d5cf802db5f977b1a3d7a78e9a68",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-cupti-12-8_12.8.90-1_amd64.deb"],
+)
+
+http_file(
+    name = "cusparselt_cuda_12_deb",
+    downloaded_file_path = "cusparselt-cuda-12.deb",
+    sha256 = "a67fa2f197cc6dc8beba2a8e83456f8ade1344827ba26e0ab1dc2069df9240d9",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cusparselt-cuda-12_0.8.1.1-1_amd64.deb"],
+)
+
+http_file(
+    name = "libcusparselt0_cuda_12_deb",
+    downloaded_file_path = "libcusparselt0-cuda-12.deb",
+    sha256 = "fda4ce288116b5e65d6abe5bd71724f0fe10d4ff2e5736fc21961ea09ecb5930",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/libcusparselt0-cuda-12_0.8.1.1-1_amd64.deb"],
+)
+
+http_file(
+    name = "libcusparselt0_dev_cuda_12_deb",
+    downloaded_file_path = "libcusparselt0-dev-cuda-12.deb",
+    sha256 = "b841487312c107190ac5656c880dadb7e4f02ed10ad03df483e55d7b49995cbe",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/libcusparselt0-dev-cuda-12_0.8.1.1-1_amd64.deb"],
+)
+
+# NCCL 2.27.5 to replace the base image's 2.25.1 which is missing symbols (ncclCommWindowRegister)
+# needed by torch 2.10+cu128. Installed via dpkg -i in the OCI container startup script.
+http_file(
+    name = "libnccl2_deb",
+    downloaded_file_path = "libnccl2.deb",
+    sha256 = "bfbad0c89f77d09406f8947f10c2ef7a2ba1b4fa2689b8772d0d85240c787315",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/libnccl2_2.27.5-1+cuda12.4_amd64.deb"],
+)
+
+# NVSHMEM 3.4.5 provides libnvshmem_host.so.3 required by torch 2.10+.
+# Installed to /usr/lib/x86_64-linux-gnu/nvshmem/12 (non-standard path, needs ldconfig conf).
+http_file(
+    name = "libnvshmem3_cuda_12_deb",
+    downloaded_file_path = "libnvshmem3-cuda-12.deb",
+    sha256 = "eb9fbcae4539c9e77ba0fb291d77d5c963b56613d3081ddf3c556280d62fdabb",
+    urls = ["https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/libnvshmem3-cuda-12_3.4.5-1_amd64.deb"],
+)

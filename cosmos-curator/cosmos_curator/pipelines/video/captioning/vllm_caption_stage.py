@@ -1,0 +1,1306 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""vLLM caption stages.
+
+The VllmPrepStage and VllmCaptionStage classes are designed to be used
+in any pipeline. Because they are designed to be used in any pipeline, they
+are generic and not specific to any particular pipeline or task type.
+
+For the VllmPrepStage and VllmCaptionStage to function properly, the
+the tasks must have these attributes/methods:
+
+- video: The video to process.
+- stage_perf: A dictionary to store performance statistics.
+- get_major_size: A method to get the major size of the task.
+
+"""
+
+import contextlib
+import dataclasses
+import gc
+import logging
+import os
+import sys
+import threading
+import time
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+import attrs
+import nvtx  # type: ignore[import-untyped]
+import psutil
+import ray
+import tenacity
+from loguru import logger
+
+from cosmos_curator.core.interfaces.model_interface import ModelInterface
+from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource, PipelineTask
+from cosmos_curator.core.utils.infra.gpu_start_helper import (
+    gpu_stage_cleanup,
+    gpu_stage_startup,
+)
+from cosmos_curator.core.utils.infra.performance_utils import StageTimer
+from cosmos_curator.core.utils.model import model_utils, pixi_utils
+from cosmos_curator.models.all_models import get_all_models_by_id
+from cosmos_curator.models.prompts import get_prompt, get_stage2_prompt
+from cosmos_curator.models.vllm_exceptions import FatalVllmDecodeError
+from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
+from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
+from cosmos_curator.pipelines.video.captioning.caption_quality_flags import (
+    DEFAULT_CAPTION_QUALITY_THRESHOLDS,
+    CaptionQualityThresholdConfig,
+    apply_caption_quality_flags,
+)
+from cosmos_curator.pipelines.video.captioning.single_inference import SingleInferenceCaptionStage
+from cosmos_curator.pipelines.video.utils import windowing_utils
+from cosmos_curator.pipelines.video.utils.data_model import (
+    CaptionOutcome,
+    CaptionResult,
+    TokenCounts,
+    Video,
+    VllmConfig,
+    Window,
+    WindowConfig,
+    get_video_from_task,
+)
+
+if pixi_utils.is_running_in_env("default"):
+    if TYPE_CHECKING:
+        from transformers import AutoProcessor
+        from vllm import LLM, SamplingParams
+
+    from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
+    from cosmos_curator.models.vllm_interface import (
+        FrameRenderContext,
+        VllmWindowResult,
+        auto_processor,
+        make_metadata,
+        make_model_inputs,
+        sampling_params,
+        vllm_caption,
+        vllm_model,
+    )
+    from cosmos_curator.pipelines.video.utils.decoder_utils import get_frame_count
+    from cosmos_curator.pipelines.video.utils.vision_process import (
+        OPENAI_CLIP_MEAN,
+        OPENAI_CLIP_STD,
+        fetch_video,
+        read_video_cpu,
+    )
+    from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
+
+    vllm_logger = logging.getLogger("vllm")
+    vllm_logger.setLevel(logging.ERROR)  # Suppress warnings and info from vLLM
+
+    def _video_debug_render_context(preprocess_mode: PreprocessMode) -> FrameRenderContext:
+        """Build the debug render context for video tensors from the video preprocessing contract."""
+        if preprocess_mode == PreprocessMode.CURATOR:
+            return FrameRenderContext.normalized_float(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD)
+        return FrameRenderContext.display_uint8()
+
+
+T = TypeVar("T", bound=PipelineTask)
+
+# Minimum free-memory fraction required at stage startup. 0.90 tolerates up
+# to ~18 GiB residual on a 184 GiB GB200 while keeping a 5-point margin over
+# ``gpu_memory_utilization=0.85``. Progression: 0.98 -> 0.95 -> 0.90.
+_VLLM_REQUIRED_FREE_FRACTION = 0.90
+
+# Window for vLLM's own ``LLMEngine.shutdown()`` (triggered by ``LLM.__del__``)
+# to drain VllmWorker via its internal IPC protocol - the only teardown path
+# that reliably releases the worker's ~30-50 GiB CUDA context.
+_VLLM_GRACEFUL_SHUTDOWN_S = 20.0
+
+# Safety-net SIGTERM grace before SIGKILL for children that survived vLLM's
+# internal shutdown. Anything that reaches SIGKILL here is expected to leak.
+_VLLM_SIGTERM_GRACE_S = 10.0
+
+# How often the background watchdog polls for ``VLLM::EngineCore`` subprocess
+# liveness. The watchdog exists to catch the case where EngineCore exits cleanly
+# (e.g. SIGTERM from the OOM-killer) while a ``process_data`` call is mid-flight
+# inside ``llm.generate()`` - the pre-call ``_engine_core_is_alive()`` check
+# cannot run for an already-running call, so the slot stays wedged on a closed
+# IPC pipe forever. 10 s is a balance between detection latency (worst case ~10 s
+# of stale-slot occupancy before we hand off to xenna) and overhead (a single
+# ``psutil.Process.children()`` walk on a quiet actor).
+_ENGINE_CORE_WATCHDOG_INTERVAL_S = 10.0
+
+
+@dataclasses.dataclass(frozen=True)
+class CaptionSingleOptions:
+    """Sampling overrides applied only by ``VllmCaptionStage.caption_single``.
+
+    All fields default to ``None``; ``None`` means "keep the value derived
+    from ``vllm_config.sampling_config``" so the per-window batch path is
+    untouched. One-shot consumers (typically ``PerEventCaptionStage``)
+    pass overrides via this struct so the per-window
+    ``self._sampling_params`` is never mutated.
+    """
+
+    sampling_fps: float | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    max_tokens: int | None = None
+
+
+# Module-level singleton used as the constructor default. Frozen
+# dataclasses are safe to share across instances; using a singleton
+# satisfies ruff B008 (no mutable function-call defaults).
+_DEFAULT_CAPTION_SINGLE_OPTIONS = CaptionSingleOptions()
+
+
+def _get_windows_from_tasks[T: PipelineTask](tasks: list[T]) -> tuple[list[Window], list[str]]:
+    """Get the windows from a list of tasks.
+
+    Args:
+        tasks: The tasks with video -> clips -> windows.
+
+    Returns:
+        The windows and clip uuids from the task.
+
+    Raises:
+        TypeError: If the task does not have a video attribute.
+
+    """
+    windows: list[Window] = []
+    clip_uuids: list[str] = []
+    for task in tasks:
+        video = get_video_from_task(task)
+        for clip in video.clips:
+            if not clip.windows:
+                logger.warning(f"Clip {clip.uuid} has no windows")
+                clip.errors["clip_windowing"] = "empty"
+                continue
+            windows += clip.windows
+            clip_uuids += [str(clip.uuid)] * len(clip.windows)
+
+    return windows, clip_uuids
+
+
+def _get_filter_windows_from_tasks[T: PipelineTask](tasks: list[T]) -> tuple[list[Window], list[str]]:
+    """Get the filter_windows from a list of tasks.
+
+    Args:
+        tasks: The tasks with video -> clips -> filter_windows.
+
+    Returns:
+        The filter_windows and clip uuids from the task.
+
+    """
+    windows: list[Window] = []
+    clip_uuids: list[str] = []
+    for task in tasks:
+        video = get_video_from_task(task)
+        for clip in video.clips:
+            if not clip.filter_windows:
+                logger.warning(f"Clip {clip.uuid} has no filter_windows")
+                clip.errors["clip_windowing"] = "empty"
+                continue
+            windows += clip.filter_windows
+            clip_uuids += [str(clip.uuid)] * len(clip.filter_windows)
+
+    return windows, clip_uuids
+
+
+def _get_stage2_prompts(vllm_config: VllmConfig, num_windows: int) -> list[str | None]:
+    """Get the stage 2 prompts for the vLLM model.
+
+    Args:
+        vllm_config: The configuration for the vLLM model.
+        num_windows: The number of windows to get the stage 2 prompts for.
+
+    Returns:
+        The stage 2 prompts for the vLLM model.
+
+    """
+    if vllm_config.stage2_caption:
+        return [get_stage2_prompt(vllm_config.stage2_prompt_text)] * num_windows
+    return [None] * num_windows
+
+
+def _scatter_captions(
+    windows: list[Window],
+    results: list["VllmWindowResult"],
+    clip_uuids: list[str],
+    model_variant: str,
+    *,
+    verbose: bool,
+) -> None:
+    """Scatter the captions and token counts back to the windows.
+
+    Args:
+        windows: The windows to scatter the captions to.
+        results: The per-window vLLM results to scatter.
+        clip_uuids: The clip uuids to scatter the captions to.
+        model_variant: The variant of the model.
+        verbose: Whether to print verbose logs.
+
+    """
+    for window, raw_result, clip_uuid in zip(windows, results, clip_uuids, strict=True):
+        result = _normalize_vllm_result(raw_result)
+        if result.text is not None:
+            window.caption[model_variant] = result.text
+        window.token_counts[model_variant] = raw_result.token_counts
+        window.caption_status = result.outcome.value
+        window.caption_failure_reason = result.failure_reason if result.outcome == CaptionOutcome.ERROR else None
+        if verbose:
+            logger.info(f"Caption for clip {clip_uuid}: {raw_result.text}")
+
+
+def _normalize_vllm_result(result: "VllmWindowResult") -> CaptionResult:
+    """Map a raw vLLM interface result to a caption result."""
+    text = result.text.strip()
+    if result.text == VLLM_UNKNOWN_CAPTION:
+        return CaptionResult(outcome=CaptionOutcome.ERROR, failure_reason="exception")
+    if result.finish_reason == "length":
+        if text:
+            return CaptionResult(outcome=CaptionOutcome.TRUNCATED, text=text)
+        return CaptionResult(outcome=CaptionOutcome.ERROR, failure_reason="exception")
+    if text:
+        return CaptionResult(outcome=CaptionOutcome.SUCCESS, text=text)
+    return CaptionResult(outcome=CaptionOutcome.ERROR, failure_reason="exception")
+
+
+def _free_vllm_inputs(windows: list[Window], model_variant: str, *, keep_mp4: bool = False) -> None:
+    """Free unused memory for the model variant.
+
+    Args:
+        windows: The windows to free unused memory for.
+        model_variant: The variant of the model.
+        keep_mp4: Whether to keep the mp4 bytes.
+
+    """
+    for window in windows:
+        window.model_input.pop(model_variant, None)
+        if not keep_mp4:
+            window.mp4_bytes.drop()
+
+
+class VllmModelInterface(ModelInterface):
+    """Information about a vLLM model."""
+
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        """Initialize the vLLM model interface."""
+        self._vllm_config = vllm_config
+
+    @property
+    def conda_env_name(self) -> str:
+        """Get the conda environment name."""
+        return "default"
+
+    @property
+    def model_id_names(self) -> list[str]:
+        """Get the model ID names."""
+        model_variant = get_vllm_model_id(self._vllm_config.model_variant)
+        models = get_all_models_by_id()
+        model = models.get(model_variant)
+
+        if model is None:
+            msg = f"Model not found for {self._vllm_config.model_variant} -> {model_variant}"
+            raise ValueError(msg)
+
+        model_id = model.get("model_id")
+        if model_id is None:
+            msg = f"Model ID not found for variant {self._vllm_config.model_variant} -> {model_variant}"
+            raise ValueError(msg)
+
+        return [cast("str", model_id)]
+
+    def setup(self) -> None:
+        """Set up the vLLM model interface."""
+
+
+class VllmPrepStage(CuratorStage):
+    """Stage that prepares cosmos-curator video data for vLLM multimodal model processing."""
+
+    def __init__(  # noqa: PLR0913
+        self,
+        vllm_config: VllmConfig,
+        window_config: WindowConfig,
+        *,
+        keep_mp4: bool = False,
+        verbose: bool = False,
+        log_stats: bool = False,
+        use_filter_windows: bool = False,
+    ) -> None:
+        """Initialize the vLLM Preparation Stage.
+
+        Args:
+            vllm_config: Configuration for the vLLM model.
+            window_config: Configuration for the windowing.
+            keep_mp4: Keep mp4 bytes for the clips in memory.
+            verbose: Whether to print verbose logs.
+            log_stats: Whether to log performance statistics.
+            use_filter_windows: If True, store windows in clip.filter_windows instead
+                of clip.windows. Use this when the stage is part of a filtering pipeline
+                rather than a captioning pipeline.
+
+        """
+        super().__init__()
+
+        self._timer = StageTimer(self)
+        self._vllm_config = vllm_config
+        self._window_config = window_config
+        self._verbose = verbose
+        self._log_stats = log_stats
+        self._processor: AutoProcessor | None = None
+        self._keep_mp4 = keep_mp4
+        self._use_filter_windows = use_filter_windows
+        self._model = VllmModelInterface(self._vllm_config)
+
+    def secondary_name(self) -> str:
+        """Get the secondary name of the stage.
+
+        Returns:
+            The secondary name of the stage.
+
+        """
+        # mypy is not smart enough to know that self._vllm_config.model_variant is a str
+        # but mypy also thinks that this is a redundant cast
+        return cast("str", self._vllm_config.model_variant)  # type: ignore[redundant-cast]
+
+    @property
+    def resources(self) -> CuratorStageResource:
+        """Get the resource requirements for this stage.
+
+        Returns:
+            The resource requirements for this stage.
+
+        """
+        return CuratorStageResource(cpus=self._vllm_config.num_cpus_for_prepare)
+
+    @property
+    def conda_env_name(self) -> str:
+        """Get the conda environment name.
+
+        Returns:
+            The conda environment name.
+
+        """
+        return "default"
+
+    def stage_setup(self) -> None:
+        """Set up the model for processing."""
+        self._processor = auto_processor(self._vllm_config)
+
+    def _prep_windows(self, video: Video, prompt: str) -> None:
+        """Prep the windows for the vLLM model.
+
+        The videos are modified in-place by creating the windows
+        for each clip in the videos and adding windows to each clip.
+
+        Model inputs are added to each window.
+
+        Args:
+            video: The video to prep the windows for.
+            prompt: The prompt to use for the vLLM model.
+
+        """
+        if self._processor is None:
+            msg = "self._processor not initialized, call stage_setup() first"
+            raise RuntimeError(msg)
+
+        num_video_decode_threads = max(1, int(self.resources.cpus) + 1)
+
+        windows, frames = windowing_utils.make_windows_for_video(
+            video,
+            self._window_config,
+            num_video_decode_threads,
+            preprocess_mode=self._vllm_config.preprocess_mode,
+            keep_mp4=self._keep_mp4,
+        )
+
+        metadata = make_metadata(frames, self._window_config)
+
+        # Create debug identifiers for frame organization
+        debug_window_ids = None
+        if self._vllm_config.debug_save_frames:
+            debug_window_ids = []
+            for window in windows:
+                # Find which clip this window belongs to
+                clip_uuid = "unknown_clip"
+                for clip in video.clips:
+                    if window in clip.windows:
+                        clip_uuid = str(clip.uuid)
+                        break
+                debug_window_ids.append(clip_uuid)
+
+        llm_inputs = make_model_inputs(
+            frames,
+            metadata,
+            self._vllm_config,
+            self._processor,
+            prompt,
+            debug_window_ids=debug_window_ids,
+            debug_render_context=(
+                _video_debug_render_context(self._vllm_config.preprocess_mode)
+                if self._vllm_config.debug_save_frames
+                else None
+            ),
+        )
+
+        for window, llm_input in zip(windows, llm_inputs, strict=True):
+            window.model_input[self._vllm_config.model_variant] = llm_input
+
+        if self._use_filter_windows:
+            for clip in video.clips:
+                clip.filter_windows = clip.windows[:]
+                clip.windows = []
+
+    @nvtx.annotate("VllmPrepStage")  # type: ignore[untyped-decorator]
+    def process_data(self, tasks: list[T]) -> list[T]:
+        """Prepare the data for the vLLM caption stage.
+
+        Args:
+            tasks: The tasks to process.
+
+        Returns:
+            The processed tasks.
+
+        """
+        if self._processor is None:
+            msg = "self._processor not initialized, call stage_setup() first"
+            raise RuntimeError(msg)
+
+        prompt = get_prompt(
+            self._vllm_config.prompt_variant,
+            self._vllm_config.prompt_text,
+            verbose=self._verbose,
+        )
+
+        for task in tasks:
+            major_size = task.get_major_size()
+            self._timer.reinit(self, major_size)
+
+            video = get_video_from_task(task)
+
+            with self._timer.time_process():
+                self._prep_windows(video, prompt)
+
+            stage_perf = getattr(task, "stage_perf", None)
+            if self._log_stats and stage_perf is not None:
+                stage_name, stage_perf_stats = self._timer.log_stats()
+                stage_perf[stage_name] = stage_perf_stats
+
+        return tasks
+
+
+class VllmCaptionStage(SingleInferenceCaptionStage):
+    """Stage that prepares video windows for vLLM multimodal model processing.
+
+    This stage handles the preparation of video windows and prompts for vLLM-based models.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        vllm_config: VllmConfig,
+        max_inflight_requests: int = 0,
+        *,
+        inflight_batching: bool = False,
+        keep_mp4: bool = False,
+        verbose: bool = False,
+        log_stats: bool = False,
+        use_filter_windows: bool = False,
+        caption_quality_flags_enabled: bool = True,
+        caption_quality_thresholds: CaptionQualityThresholdConfig = DEFAULT_CAPTION_QUALITY_THRESHOLDS,
+        caption_single_options: CaptionSingleOptions = _DEFAULT_CAPTION_SINGLE_OPTIONS,
+    ) -> None:
+        """Initialize the vLLM caption stage.
+
+        Args:
+            vllm_config: Configuration for the vLLM model.
+            max_inflight_requests: Maximum number of inflight requests to vLLM
+               engine. Set to 0 for unlimited inflight requests. Ignored if
+               inflight_batching is False.
+            inflight_batching: set to True to enable inflight batching.
+            keep_mp4: Whether to keep the mp4 bytes.
+            verbose: Whether to print verbose logs.
+            log_stats: Whether to log performance statistics.
+            use_filter_windows: If True, read windows from clip.filter_windows instead
+                of clip.windows. Use this when paired with VllmPrepStage(use_filter_windows=True).
+            caption_quality_flags_enabled: Whether to annotate subject-caption windows
+                with heuristic caption quality flags.
+            caption_quality_thresholds: Threshold policy for caption quality flags.
+            caption_single_options: Sampling overrides applied only by
+                :meth:`caption_single`. The default empty struct keeps
+                the per-window batch path's ``SamplingParams`` and the
+                historical 2.0 fps decode fallback. One-shot consumers
+                (e.g. ``PerEventCaptionStage``) pass populated fields to
+                widen the per-event sampling without disturbing the
+                per-window defaults.
+
+        """
+        super().__init__()
+
+        self._timer = StageTimer(self)
+        self._vllm_config = vllm_config
+        self._llm: LLM | None = None
+        self._sampling_params: SamplingParams | None = None
+        self._processor: AutoProcessor | None = None
+        self._keep_mp4 = keep_mp4
+        self._verbose = verbose
+        self._log_stats = log_stats
+        self._vllm_use_tqdm = False
+        self._model = VllmModelInterface(self._vllm_config)
+        self._max_inflight_requests = max_inflight_requests
+        self._inflight_batching = inflight_batching
+        self._use_filter_windows = use_filter_windows
+        self._caption_quality_flags_enabled = caption_quality_flags_enabled
+        self._caption_quality_thresholds = caption_quality_thresholds
+        # caption_single overrides — unpacked to private fields so helper
+        # methods can read them without ``self._caption_single_options.<field>``
+        # bookkeeping. The dataclass is just a tidy constructor surface.
+        self._caption_single_sampling_fps = caption_single_options.sampling_fps
+        self._caption_single_temperature = caption_single_options.temperature
+        self._caption_single_top_p = caption_single_options.top_p
+        self._caption_single_top_k = caption_single_options.top_k
+        self._caption_single_max_tokens = caption_single_options.max_tokens
+        self._caption_single_sampling_params: SamplingParams | None = None
+        # Background watchdog state. Both must stay None here so the stage instance
+        # remains picklable - xenna deepcopies the pipeline spec before sending it to
+        # remote actors, and ``threading.Event`` contains a ``_thread.lock`` that is
+        # not picklable. The real ``Event`` is created lazily by
+        # ``_start_engine_core_watchdog`` on the remote actor in ``stage_setup``.
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop_event: threading.Event | None = None
+
+    def stage_setup_on_node(self) -> None:
+        """Set up on a node by copying model weights if configured.
+
+        This method copies model weights from the default cache location to a
+        user-configured directory (e.g., local SSD) before loading the model.
+
+        If the copy fails, the model will use the default cache location.
+
+        """
+        if self._vllm_config.copy_weights_to is None:
+            logger.debug("No custom weights directory configured, skipping weight copy")
+        else:
+            for model_id in self._model.model_id_names:
+                source_dir = model_utils.get_local_dir_for_weights_name(model_id)
+
+                if not source_dir.exists():
+                    msg = f"Source model weights directory does not exist: {source_dir}"
+                    raise FileNotFoundError(msg)
+
+                dest_dir = self._vllm_config.copy_weights_to / model_id
+                logger.info(f"Copying model weights for {model_id} from {source_dir} to {dest_dir}")
+
+                try:
+                    model_utils.copy_model_weights(source_dir, dest_dir)
+                    logger.info(f"Successfully copied model weights to {dest_dir}")
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to copy model weights, will use default location")
+
+        # Instantiate vLLM Engine involves torch.compile which produces cache
+        # To avoid conflict, do it once here.
+        #
+        # The engine is deliberately left alive: xenna promotes this same actor (same OS
+        # process) from node setup to a regular worker, and ``stage_setup``'s
+        # ``if self._llm is None`` guard reuses this engine instead of rebuilding it.
+        gpu_stage_startup(
+            f"{self.__class__.__name__}-on-node",
+            self.resources.gpus,
+            pre_setup=True,
+            expected_free_fraction=_VLLM_REQUIRED_FREE_FRACTION,
+        )
+        try:
+            self._llm = vllm_model(self._vllm_config)
+        except BaseException:
+            # A partially-built engine has usually already spawned ``VLLM::EngineCore``
+            # children. This actor never reaches ``stage_setup``, so xenna tears it down
+            # with ``ray.kill()`` and skips ``destroy()`` because setup never completed.
+            # Since Ray 2.57 enables ``process_group_cleanup_enabled`` by default the
+            # raylet then ``killpg``s the actor's whole process group, which can SIGKILL a
+            # child mid-``torch.compile``-cache-write and leave every later worker hitting
+            # the concurrent-recompile conflict this warm-up exists to prevent. Release
+            # the children ourselves; a teardown failure must not mask the setup error.
+            try:
+                self._release_vllm_engine()
+            except Exception:  # noqa: BLE001 - must not mask the setup error
+                logger.exception("Failed to release the partially-built node-setup vLLM engine")
+            raise
+        gpu_stage_startup(f"{self.__class__.__name__}-on-node", self.resources.gpus, pre_setup=False)
+
+    def stage_setup(self) -> None:
+        """Set up the model for processing."""
+        if self._llm is None:
+            # Reap any orphan ``VLLM::EngineCore`` processes left behind by a prior
+            # actor that died hard on this node (SIGSEGV/SIGKILL/OOM-kill). Such
+            # orphans typically release their GPU memory via vLLM's IPC-closure
+            # handler, but the Python process itself persists indefinitely - leaking
+            # CPU/RAM/process slots and potentially holding small CUDA contexts that
+            # accumulate over multiple recoveries. Runs before ``gpu_stage_startup``
+            # so the post-reap state is what the readiness check sees.
+            self._kill_orphan_engine_cores()
+            gpu_stage_startup(
+                self.__class__.__name__,
+                self.resources.gpus,
+                pre_setup=True,
+                expected_free_fraction=_VLLM_REQUIRED_FREE_FRACTION,
+            )
+            self._llm = vllm_model(self._vllm_config)
+        self._sampling_params = sampling_params(self._vllm_config.sampling_config)
+        self._caption_single_sampling_params = self._build_caption_single_sampling_params()
+        self._processor = auto_processor(self._vllm_config)
+        gpu_stage_startup(self.__class__.__name__, self.resources.gpus, pre_setup=False)
+        # Start the EngineCore watchdog only after vLLM is fully up, so it doesn't fire
+        # spuriously during mid-init (when subprocesses are still being spawned).
+        self._start_engine_core_watchdog()
+
+    def destroy(self) -> None:
+        """Release vLLM and GPU resources before the actor exits.
+
+        Safe to call when ``stage_setup`` never ran.
+        """
+        start = time.monotonic()
+        self._release_vllm_engine()
+        elapsed = time.monotonic() - start
+        logger.info(f"VllmCaptionStage.destroy: completed in {elapsed:.1f}s")
+
+    def _release_vllm_engine(self) -> None:
+        """Tear down the vLLM engine and its subprocesses, leaving ``self._llm`` as ``None``.
+
+        Order matters: stop the watchdog first so it doesn't ``os._exit(1)`` mid-teardown
+        when the intentional subprocess exits below trigger its liveness check (a no-op
+        when no watchdog was ever started). Then drop ``self._llm`` so vLLM's internal
+        ``LLMEngine.shutdown()`` can drain VllmWorker via IPC - the only path that
+        releases its CUDA context; SIGTERM/SIGKILL are last-resort fallbacks.
+
+        Shared by ``destroy()`` and the ``stage_setup_on_node`` failure path.
+        """
+        self._stop_engine_core_watchdog()
+        self._drop_vllm_refs()
+        self._wait_for_vllm_children_exit(_VLLM_GRACEFUL_SHUTDOWN_S)
+        self._terminate_vllm_subprocesses()
+        gpu_stage_cleanup(self.__class__.__name__)
+
+    def _wait_for_vllm_children_exit(self, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for vLLM subprocesses to exit on their own.
+
+        Called after ``_drop_vllm_refs`` so ``LLM.__del__`` -> ``LLMEngine.shutdown()``
+        has a bounded window to terminate VllmWorker via vLLM's IPC protocol.
+        """
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.NoSuchProcess:
+            return
+        if not children:
+            return
+        gone, alive = psutil.wait_procs(children, timeout=timeout)
+        if not alive:
+            logger.info(
+                f"VllmCaptionStage.destroy: all {len(gone)} vLLM child(ren) exited via "
+                f"internal shutdown within {timeout:.0f}s"
+            )
+        else:
+            alive_desc = []
+            for child in alive:
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    alive_desc.append(f"pid={child.pid} name={child.name()!r}")
+            logger.info(
+                f"VllmCaptionStage.destroy: {len(gone)}/{len(children)} child(ren) exited via "
+                f"vLLM shutdown; {len(alive)} survived and will be signaled: {alive_desc}"
+            )
+
+    def _terminate_vllm_subprocesses(self) -> None:
+        """Safety-net SIGTERM-then-SIGKILL for children that survived graceful shutdown.
+
+        Normally a no-op after ``_wait_for_vllm_children_exit``. Anything reaching
+        SIGKILL here is expected to leak its CUDA context (warned below).
+        """
+        try:
+            me = psutil.Process()
+            children = me.children(recursive=True)
+        except psutil.NoSuchProcess:
+            return
+
+        if not children:
+            return
+
+        target_names = []
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                target_names.append(f"pid={child.pid} name={child.name()!r}")
+        logger.info(f"VllmCaptionStage.destroy: terminating {len(children)} child process(es): {target_names}")
+
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.terminate()
+
+        gone, alive = psutil.wait_procs(children, timeout=_VLLM_SIGTERM_GRACE_S)
+        for child in alive:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                logger.warning(
+                    f"VllmCaptionStage.destroy: pid={child.pid} name={child.name()!r} ignored SIGTERM "
+                    f"after {_VLLM_SIGTERM_GRACE_S:.0f}s; sending SIGKILL (may leak GPU memory)"
+                )
+                child.kill()
+        if alive:
+            psutil.wait_procs(alive, timeout=2.0)
+        logger.info(f"VllmCaptionStage.destroy: terminated {len(gone)} via SIGTERM, {len(alive)} required SIGKILL")
+
+    @staticmethod
+    def _in_ray_actor_context() -> bool:
+        """Return True iff currently executing inside a Ray actor worker.
+
+        ``ray.actor.exit_actor()`` raises ``TypeError`` when invoked from a non-actor
+        context (driver, unit test, etc.), which would mask the underlying recovery
+        intent. Call this guard before any ``exit_actor`` invocation so callers can
+        fall back to ordinary exception handling in tests / driver code.
+        """
+        try:
+            # ``ray._private.worker`` is the only documented way to introspect actor
+            # context; Ray itself recommends this attribute access in its own examples.
+            # Lazy import so the dependency is local to this function.
+            import ray._private.worker as _ray_worker_internal  # noqa: PLC0415
+
+            worker = _ray_worker_internal.global_worker
+            return worker.mode == ray.WORKER_MODE and not worker.actor_id.is_nil()
+        except Exception:  # noqa: BLE001 - any Ray internals access can fail; treat as "not actor"
+            return False
+
+    @staticmethod
+    def _is_live_engine_core(child: psutil.Process) -> bool:
+        """Return True if ``child`` is a live (non-zombie/dead) ``VLLM::EngineCore`` process."""
+        try:
+            cmdline = " ".join(child.cmdline())
+            status = child.status()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False
+        return "EngineCore" in cmdline and status not in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+
+    def _engine_core_is_alive(self) -> bool:
+        """Return True if at least one live ``VLLM::EngineCore`` subprocess is present.
+
+        Catches clean shutdowns of the GPU-resident EngineCore subprocess (e.g. SIGTERM
+        from ``systemd-oomd``, a container's signal-propagation chain, or vLLM's own
+        engine-side watchdog) that don't surface as exceptions in the parent process.
+
+        Returns ``True`` when the underlying ``psutil`` call cannot enumerate children
+        (e.g. macOS sandbox blocks ``sysctl()``, kernel-level ``EPERM`` on hardened
+        containers): we cannot prove the engine is dead, so do *not* trigger a false
+        positive recovery. Production Linux workers always succeed.
+        """
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.AccessDenied, PermissionError, OSError) as exc:
+            logger.debug(f"psutil children() unavailable ({exc!r}); assuming EngineCore alive.")
+            return True
+        return any(self._is_live_engine_core(child) for child in children)
+
+    def _kill_orphan_engine_cores(self) -> None:
+        """SIGKILL any orphan ``VLLM::EngineCore`` processes from prior dead actors.
+
+        When a ``StageWorker`` dies abruptly (SIGSEGV, SIGKILL, OOM-killer), no
+        Python-level cleanup runs - neither ``destroy()`` nor the watchdog gets a
+        chance to terminate the EngineCore child. The kernel reparents the orphan to
+        PID 1 (init), where it usually releases its GPU allocation through vLLM's
+        IPC-closure handler but keeps the Python interpreter resident indefinitely.
+        Over multiple recoveries these accumulate, exhausting process slots / RAM and
+        sometimes leaving small CUDA contexts that block fresh allocations.
+
+        Strategy: scan all processes on the node and SIGKILL any whose cmdline marks
+        them as an EngineCore *and* whose parent is PID 1 (the unambiguous orphan
+        signature - a live sibling actor's EngineCore has ``ppid == that_actor_pid``,
+        never 1). This is safe even with multiple live ``VllmCaptionStage`` actors on
+        the same node, because we never touch processes with a live parent.
+
+        Called from ``stage_setup`` on every newly-spawned actor so replacement
+        actors clean up after their dead predecessors before bringing vLLM back up.
+        """
+        # Defensive: if our actor process is PID 1 (unusual, but possible in some
+        # container entrypoint configs), our own live children also have ppid==1 and
+        # would be indistinguishable from orphans. Skip the sweep rather than risk a
+        # self-kill; Ray + the standard image runs raylet as PID 1, not actors.
+        if os.getpid() == 1:
+            logger.warning("Skipping orphan EngineCore sweep: actor is PID 1, cannot disambiguate.")
+            return
+
+        orphans: list[psutil.Process] = []
+        for proc in psutil.process_iter(["pid", "ppid", "cmdline"]):
+            try:
+                if proc.info["ppid"] != 1:
+                    continue
+                cmdline = " ".join(proc.info["cmdline"] or [])
+                if "EngineCore" not in cmdline:
+                    continue
+                orphans.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not orphans:
+            return
+
+        pids = [p.info["pid"] for p in orphans]
+        logger.warning(
+            f"Found {len(orphans)} orphan VLLM::EngineCore process(es) "
+            f"(parent died unexpectedly); SIGKILLing them: {pids}"
+        )
+        for proc in orphans:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                proc.kill()
+        gone, alive = psutil.wait_procs(orphans, timeout=5.0)
+        if alive:
+            stuck_pids = [p.pid for p in alive]
+            logger.error(f"Orphan EngineCore(s) survived SIGKILL after 5s: {stuck_pids}")
+        else:
+            logger.info(f"Reaped {len(gone)} orphan VLLM::EngineCore process(es).")
+
+    def _start_engine_core_watchdog(self) -> None:
+        """Start the background EngineCore liveness watchdog (idempotent).
+
+        Installs a *fresh* ``self._watchdog_stop_event`` on every start to avoid
+        stale thread resurrection.
+
+        The event is created here (lazily, on the remote actor) rather than in
+        ``__init__`` so the stage instance stays picklable for xenna's pre-launch
+        ``deepcopy`` of the pipeline spec - ``threading.Event`` holds a
+        ``_thread.lock`` which is not picklable.
+        """
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop_event = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._engine_core_watchdog_loop,
+            name="VllmCaptionStage-EngineCoreWatchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+        logger.debug(f"VllmCaptionStage: started EngineCore watchdog (pid={os.getpid()})")
+
+    def _stop_engine_core_watchdog(self) -> None:
+        """Stop the watchdog and wait briefly for the thread to exit.
+
+        Called from ``destroy()`` before we intentionally kill EngineCore so the
+        watchdog doesn't observe the (intentional) subprocess loss and ``os._exit``
+        the actor mid-teardown. No-op if the watchdog was never started.
+        """
+        if self._watchdog_stop_event is not None:
+            self._watchdog_stop_event.set()
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=2.0)
+            if self._watchdog_thread.is_alive():
+                # Thread still running past the join deadline: ``_terminate_vllm_subprocesses``
+                # is about to kill EngineCore, and a still-active watchdog could observe that
+                # kill as a failure and ``os._exit`` mid-teardown. Risk is small and harmless
+                # but worth surfacing if it ever happens.
+                logger.warning("VllmCaptionStage: watchdog thread did not exit within 2s; proceeding with teardown.")
+        self._watchdog_thread = None
+
+    def _engine_core_watchdog_loop(self) -> None:
+        """Periodically check EngineCore liveness; ``os._exit`` the actor if it's gone.
+
+        Complements the pre-call ``_engine_core_is_alive()`` check in ``process_data``,
+        which can only fire on a *new* ``process_data`` call. The pre-call check misses
+        the case where SIGTERM (or any clean-shutdown signal) lands on EngineCore while
+        ``process_data`` is mid-flight inside ``llm.generate()``: vLLM's IPC layer
+        blocks on ``recv()`` against the now-closed pipe forever, so the slot's
+        ``process_data`` never returns and the next call (where our pre-check would
+        run) never happens.
+
+        Implementation notes:
+            - Uses ``os._exit(1)`` rather than ``ray.actor.exit_actor()`` because the
+              latter raises ``SystemExit`` and from a non-main thread only kills the
+              calling thread, leaving the actor (and its wedged slots) alive. ``os._exit``
+              terminates the whole process unconditionally, which Ray observes as
+              ``ActorDiedError`` and xenna's ``_handle_actor_death`` recovers from
+              normally.
+            - Reads stdout/stderr are flushed first because ``os._exit`` skips Python's
+              normal interpreter shutdown (including buffered I/O flushing), so the
+              "exiting actor" log line could otherwise be lost.
+            - Stops cleanly when ``destroy()`` sets the stop event - the loop's
+              ``Event.wait(timeout=...)`` returns True on signal, breaking the loop.
+        """
+        # Snapshot the event reference. ``_start_engine_core_watchdog`` always assigns
+        # a non-None Event before spawning this thread, but the type checker can't see
+        # that invariant - this snapshot both narrows the type and avoids re-reading
+        # the attribute across iterations (cheap defensive practice).
+        stop_event = self._watchdog_stop_event
+        if stop_event is None:
+            return
+        while not stop_event.wait(timeout=_ENGINE_CORE_WATCHDOG_INTERVAL_S):
+            # Defense-in-depth against stale-thread resurrection: if a newer watchdog
+            # has taken over (our snapshot is no longer the instance's active event),
+            # exit quietly. ``_start_engine_core_watchdog`` always installs a fresh
+            # Event, so this only ever fires for an orphaned thread from a prior setup
+            # whose teardown ``join`` timed out.
+            if stop_event is not self._watchdog_stop_event:
+                return
+            if self._llm is None:
+                # Actor is being torn down through the normal path; let it proceed.
+                return
+            if self._engine_core_is_alive():
+                continue
+            logger.error(
+                "vLLM EngineCore subprocess died (watchdog detected after no in-band "
+                "exception); exiting actor so xenna can replace this worker group."
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # Must be os._exit (not sys.exit / ray.actor.exit_actor) to escape a wedged
+            # actor from a daemon thread - see this method's docstring for the rationale.
+            os._exit(1)
+
+    def _drop_vllm_refs(self) -> None:
+        """Release Python-side references to vLLM and force a GC pass.
+
+        vLLM's ``LLM`` wrapper does most of its native cleanup in ``__del__``. Setting
+        the attribute to None (rather than ``del``ing it) keeps the actor in a
+        re-setup-able state in case ``destroy()`` is ever called outside the
+        teardown path.
+        """
+        self._llm = None
+        self._sampling_params = None
+        self._processor = None
+        gc.collect()
+
+    def _reset(self) -> None:
+        """Reset the vLLM model.
+
+        Used by the ``process_data`` retry path to recycle a vLLM engine that errored
+        mid-flight. Reuses the same teardown as the shutdown path so the recycled
+        actor doesn't leak GPU memory between attempts. ``gpu_stage_cleanup`` only
+        drops Python refs and empties torch's caching allocator (no
+        ``cudaDeviceReset()``), so torch's cached CUDA state stays valid and the
+        immediate ``stage_setup`` can rebuild vLLM cleanly in the same process.
+        """
+        self.destroy()
+        self.stage_setup()
+
+    def secondary_name(self) -> str:
+        """Get the secondary name of the stage.
+
+        Returns:
+            The secondary name of the stage.
+
+        """
+        # mypy is not smart enough to know that self._vllm_config.model_variant is a str
+        # but mypy also thinks that this is a redundant cast
+        return cast("str", self._vllm_config.model_variant)  # type: ignore[redundant-cast]
+
+    @property
+    def conda_env_name(self) -> str:
+        """Get the conda environment name.
+
+        Returns:
+            The conda environment name.
+
+        """
+        return "default"
+
+    @property
+    def resources(self) -> CuratorStageResource:
+        """Get the resource requirements for this stage.
+
+        Returns:
+            The resource requirements for this stage.
+
+        """
+        return CuratorStageResource(gpus=self._vllm_config.num_gpus)
+
+    @property
+    def model(self) -> VllmModelInterface:
+        """Get the model for this stage.
+
+        Returns:
+            The model for this stage.
+
+        """
+        return self._model
+
+    def _apply_caption_quality_flags(self, tasks: list[T]) -> None:
+        if not self._caption_quality_flags_enabled or self._use_filter_windows:
+            return
+
+        window_groups = [clip.windows for task in tasks for clip in get_video_from_task(task).clips if clip.windows]
+        apply_caption_quality_flags(
+            window_groups,
+            self._vllm_config.model_variant,
+            thresholds=self._caption_quality_thresholds,
+        )
+
+    def _build_caption_single_sampling_params(self) -> "SamplingParams":
+        """Return a fresh ``SamplingParams`` for ``caption_single`` with overrides applied.
+
+        Uses ``vllm_config.sampling_config`` as the base and clones the
+        result so the per-window ``self._sampling_params`` is unaffected
+        by per-call overrides. ``None`` overrides leave the base value
+        untouched.
+        """
+        base = sampling_params(self._vllm_config.sampling_config)
+        if self._caption_single_temperature is not None:
+            base.temperature = float(self._caption_single_temperature)
+        if self._caption_single_top_p is not None:
+            base.top_p = float(self._caption_single_top_p)
+        if self._caption_single_top_k is not None:
+            base.top_k = int(self._caption_single_top_k)
+        if self._caption_single_max_tokens is not None:
+            base.max_tokens = int(self._caption_single_max_tokens)
+        return base
+
+    def _decode_video_for_caption_single(self, video_bytes: bytes) -> tuple[Any, dict[str, Any]]:
+        """Decode whole-clip mp4 bytes into a frame tensor + HF video metadata.
+
+        Branches on ``VllmConfig.preprocess_mode``: model-side preprocessing
+        needs decoded uint8 TCHW frames + HF's own video processor; curator
+        preprocessing uses the float16 ``fetch_video`` path.
+        """
+        total_frames = get_frame_count(video_bytes)
+        if total_frames <= 0:
+            msg = "video bytes contain 0 decodable frames"
+            raise RuntimeError(msg)
+        # VllmConfig has no window_config — the per-window pipeline passes
+        # WindowConfig separately to VllmPrepStage. caption_single defaults to
+        # the same coarse fps as the historical per-event Qwen path (2.0); per-
+        # event callers usually override via ``caption_single_options.sampling_fps``.
+        sampling_fps = self._caption_single_sampling_fps if self._caption_single_sampling_fps is not None else 2.0
+        # ``WindowFrameInfo.end`` is inclusive (see windowing_types.py and
+        # ``windowing_utils.make_windows_for_video``); ``end=total_frames``
+        # would request a frame at out-of-range index ``total_frames``.
+        window_range = [WindowFrameInfo(start=0, end=total_frames - 1)]
+        needs_raw_frames = self._vllm_config.model_preprocess_enabled
+        with buffer_as_memfd_path(video_bytes, name="vllm-caption-single") as path:
+            if needs_raw_frames:
+                video_tensor, _frame_counts = read_video_cpu(
+                    path,
+                    sampling_fps,
+                    0,
+                    window_range,
+                )
+            else:
+                video_tensor, _frame_counts = fetch_video(
+                    path,
+                    sampling_fps=sampling_fps,
+                    window_range=window_range,
+                    preprocess_mode=PreprocessMode.CURATOR,
+                )
+
+        num_sampled_frames = int(video_tensor.shape[0]) if video_tensor.ndim >= 1 else 0
+        duration_s = float(num_sampled_frames) / sampling_fps if sampling_fps > 0 else 0.0
+        # Qwen3-VL requires HF-style video metadata; Qwen2.5-VL ignores it.
+        # We pre-sample here so the processor skips its own sampling step.
+        video_metadata: dict[str, Any] = {
+            "total_num_frames": num_sampled_frames,
+            "fps": float(sampling_fps),
+            "duration": duration_s,
+            "video_backend": "opencv_dynamic",
+            "frames_indices": list(range(num_sampled_frames)),
+            "do_sample_frames": False,
+        }
+        return video_tensor, video_metadata
+
+    def caption_single(self, prompt: str, video_bytes: bytes) -> str:
+        """Implement :class:`SingleInferenceCaptionStage` for one-shot consumers.
+
+        Decodes ``video_bytes`` once, builds a single ``llm_input`` via
+        the same plugin path as the per-window batch, and invokes the
+        already-initialised ``self._llm`` engine. Sampling overrides
+        configured at construction time (temperature/top_p/top_k/
+        max_tokens) are applied via the cloned
+        ``_caption_single_sampling_params``; the per-window
+        ``_sampling_params`` is left intact.
+        """
+        if self._llm is None:
+            msg = "vLLM model not initialised; call stage_setup before caption_single."
+            raise RuntimeError(msg)
+        if self._processor is None:
+            msg = "Processor not initialised; call stage_setup before caption_single."
+            raise RuntimeError(msg)
+        if self._caption_single_sampling_params is None:
+            msg = "caption_single sampling params not built; call stage_setup first."
+            raise RuntimeError(msg)
+
+        video_tensor, video_metadata = self._decode_video_for_caption_single(video_bytes)
+        caption_single_config = attrs.evolve(self._vllm_config, video_max_pixels_per_frame=None)
+        llm_inputs = make_model_inputs(
+            videos=[video_tensor],
+            metadata=[video_metadata],
+            config=caption_single_config,
+            processor=self._processor,
+            prompt=prompt,
+            debug_render_context=(
+                _video_debug_render_context(caption_single_config.preprocess_mode)
+                if caption_single_config.debug_save_frames
+                else None
+            ),
+        )
+        if not llm_inputs:
+            msg = "make_model_inputs produced no inputs for caption_single."
+            raise RuntimeError(msg)
+
+        outputs = self._llm.generate(
+            llm_inputs,  # type: ignore[arg-type]
+            sampling_params=self._caption_single_sampling_params,
+            use_tqdm=False,
+        )
+        if not outputs or not outputs[0].outputs:
+            msg = "vLLM engine returned no outputs for caption_single."
+            raise RuntimeError(msg)
+        text = outputs[0].outputs[0].text
+        if not text or not str(text).strip():
+            finish_reason = outputs[0].outputs[0].finish_reason
+            msg = f"vLLM engine returned empty caption (finish_reason={finish_reason!r})"
+            raise RuntimeError(msg)
+        return str(text).strip()
+
+    def _require_ready(self) -> tuple["LLM", "SamplingParams", "AutoProcessor"]:
+        """Return the vLLM trio narrowed to non-None, or raise.
+
+        Called on every tenacity retry inside ``_vllm_caption`` so a retry after
+        ``_reset()`` picks up the rebuilt engine (or fails fast if
+        ``stage_setup()`` couldn't rebuild it).
+        """
+        if self._llm is None or self._sampling_params is None or self._processor is None:
+            msg = "vLLM engine unavailable (stage_setup not run or _reset rebuild failed)"
+            raise RuntimeError(msg)
+        return self._llm, self._sampling_params, self._processor
+
+    @nvtx.annotate("VllmCaptionStage")  # type: ignore[untyped-decorator]
+    def process_data(self, tasks: list[T]) -> list[T]:  # noqa: C901, PLR0915
+        """Process the data for the vLLM caption stage.
+
+        Args:
+            tasks: The tasks to process.
+
+        Returns:
+            The processed tasks.
+
+        """
+        if self._llm is None:
+            # Reaching this point with no engine means a prior batch's retry path called
+            # ``_reset()`` (which nulls ``self._llm`` via ``destroy()``) and the subsequent
+            # ``stage_setup()`` failed to rebuild it - usually because the GPU is contaminated
+            # with leaked memory from a dead EngineCore subprocess. Raising RuntimeError here
+            # would surface as RayTaskError on the driver (not in xenna's _ACTOR_DEATH_ERRORS),
+            # killing the whole pipeline. Instead, exit the actor cleanly: xenna catches
+            # ActorDiedError, requeues in-flight tasks, and replaces this worker group.
+            msg = "vLLM engine unavailable after retry/recovery"
+            logger.error(f"{msg}; exiting actor so xenna can replace this worker group.")
+            if self._in_ray_actor_context():
+                ray.actor.exit_actor()  # type: ignore[no-untyped-call]  # never returns
+            # Driver / unit-test fallback: surface as a normal exception so the caller sees it.
+            raise RuntimeError(msg)
+
+        if not self._engine_core_is_alive():
+            # The vLLM ``LLM`` wrapper still looks healthy from Python's perspective, but
+            # its GPU-resident ``VLLM::EngineCore`` subprocess has exited (e.g. SIGTERM from
+            # the OOM-killer or a container shutdown signal). The next vLLM call would
+            # block forever in an IPC ``recv()`` against the closed pipe, leaving xenna
+            # unable to detect or recover the worker. Hand off to xenna proactively.
+            logger.error(
+                "vLLM EngineCore subprocess unavailable; exiting actor so xenna can replace this worker group."
+            )
+            if self._in_ray_actor_context():
+                ray.actor.exit_actor()  # type: ignore[no-untyped-call]  # never returns
+            # Driver / unit-test fallback: tests with mocked ``_llm`` won't have a real
+            # EngineCore subprocess - skip the exit and let the mocked ``generate`` path run.
+
+        if self._sampling_params is None:
+            msg = "Sampling parameters not initialized, call stage_setup() first"
+            raise RuntimeError(msg)
+
+        if self._processor is None:
+            msg = "Processor not initialized, call stage_setup() first"
+            raise RuntimeError(msg)
+
+        major_size = sum(task.get_major_size() for task in tasks)
+        self._timer.reinit(self, major_size)
+
+        @tenacity.retry(
+            stop=tenacity.stop_after_attempt(self._vllm_config.max_retries),
+            reraise=True,
+            retry=tenacity.retry_if_not_exception_type(FatalVllmDecodeError),
+        )
+        def _vllm_caption(
+            model_inputs: list[dict[str, Any]], stage2_prompts: list[str | None]
+        ) -> list["VllmWindowResult"]:
+            # Re-read the trio each attempt so a retry after ``_reset()`` sees the
+            # rebuilt engine instead of the destroyed one. ``self._*`` are the only
+            # long-lived refs, so ``self._llm = None`` in ``_drop_vllm_refs`` is enough
+            # to let ``LLM.__del__`` fire during ``destroy()``'s graceful-shutdown wait.
+            llm, sampling_params, processor = self._require_ready()
+            try:
+                results = vllm_caption(
+                    model_inputs,
+                    llm,
+                    processor,
+                    sampling_params,
+                    self._vllm_config,
+                    inflight_batching=self._inflight_batching,
+                    max_inflight_requests=self._max_inflight_requests,
+                    stage2_prompts=stage2_prompts,
+                )
+            except FatalVllmDecodeError:
+                raise
+            except Exception as e:
+                input_videos = [str(get_video_from_task(t).input_video) for t in tasks]
+                input_videos_str = ", ".join(input_videos)
+                logger.exception(f"Error generating captions for video {input_videos_str}, trying again")
+                for task in tasks:
+                    video = get_video_from_task(task)
+                    video.errors["captioning"] = f"vLLM captioning error: {e}"
+
+                del llm, sampling_params, processor
+                e.__traceback__ = None
+                self._reset()
+                raise
+            else:
+                for task in tasks:
+                    video = get_video_from_task(task)
+                    video.errors.pop("captioning", None)
+
+                return results
+
+        with self._timer.time_process():
+            # Gather model inputs and clip uuids
+            if self._use_filter_windows:
+                windows, clip_uuids = _get_filter_windows_from_tasks(tasks)
+            else:
+                windows, clip_uuids = _get_windows_from_tasks(tasks)
+            model_inputs = [window.model_input[self._vllm_config.model_variant] for window in windows]
+
+            # Set up stage 2 prompts if enabled
+            stage2_prompts = _get_stage2_prompts(self._vllm_config, len(windows))
+
+            # Generate captions
+            try:
+                results = _vllm_caption(model_inputs, stage2_prompts)
+            except FatalVllmDecodeError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.error(f"All {self._vllm_config.max_retries} retry attempts exhausted; captioning failed")
+                results = [
+                    VllmWindowResult(text="", finish_reason=None, token_counts=TokenCounts()) for _ in model_inputs
+                ]
+
+            # Scatter captions back to windows
+            _scatter_captions(windows, results, clip_uuids, self._vllm_config.model_variant, verbose=self._verbose)
+            self._apply_caption_quality_flags(tasks)
+
+            logger.info(f"Generated {len(results)} captions for {len(tasks)} tasks")
+
+        if self._log_stats:
+            # Because there's a single call to caption all tasks, just log the first task's stage_perf.
+            stage_name, stage_perf_stats = self._timer.log_stats()
+            stage_perf = getattr(tasks[0], "stage_perf", None)
+            if stage_perf is not None:
+                stage_perf[stage_name] = stage_perf_stats
+
+        _free_vllm_inputs(windows, self._vllm_config.model_variant, keep_mp4=self._keep_mp4)
+        return tasks

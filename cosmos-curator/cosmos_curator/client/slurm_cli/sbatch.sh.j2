@@ -1,0 +1,201 @@
+#!/bin/bash
+
+#SBATCH --job-name={{job_name}}
+{% if account %}
+#SBATCH -A {{account}}
+{% endif %}
+{% if partition %}
+#SBATCH -p {{partition}}
+{% endif %}
+#SBATCH --nodes={{num_nodes}}
+#SBATCH --ntasks={{num_nodes}}
+#SBATCH --ntasks-per-node=1
+#SBATCH --propagate=NONE
+#SBATCH --distribution=cyclic
+{% if exclusive %}
+#SBATCH --exclusive
+{% endif %}
+#SBATCH --output={{log_dir}}/%x_%j.log
+{% if comment %}
+#SBATCH --comment="{{comment}}"
+{% else %}
+#SBATCH --comment=fact_off
+{% endif %}
+{% if mail_user %}
+#SBATCH --mail-user={{mail_user}}
+{% endif %}
+{% if mail_type %}
+#SBATCH --mail-type={{mail_type}}
+{% endif %}
+
+{% if time_limit_string %}
+#SBATCH --time={{time_limit_string}}
+{% endif %}
+{% if gres %}
+#SBATCH --gres={{gres}}
+{% endif %}
+{% if gpus %}
+#SBATCH --gpus={{gpus}}
+{% endif %}
+{% if gpus_per_node %}
+#SBATCH --gpus-per-node={{gpus_per_node}}
+{% endif %}
+{% if qos %}
+#SBATCH --qos={{qos}}
+{% endif %}
+{% if exclude_nodes %}
+#SBATCH --exclude={{ exclude_nodes | join(',') }}
+{% endif %}
+{% if requeue %} 
+#SBATCH --requeue
+{% else %}
+#SBATCH --no-requeue
+{% endif %}
+#SBATCH --dependency=singleton
+
+##### Number of total processes
+echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
+echo "Nodelist:= " $SLURM_JOB_NODELIST
+echo "Number of nodes:= " $SLURM_JOB_NUM_NODES
+echo "Ntasks per node:= " $SLURM_NTASKS_PER_NODE
+echo "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX "
+
+# ******************* These are read internally it seems ***********************************
+# ******** Master port, address and world size MUST be passed as variables for DDP to work
+job_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+job_nodes_status=$?
+head_node=${job_nodes%%$'\n'*}
+if [ "${job_nodes_status}" -ne 0 ]; then
+  echo "Failed to resolve the Slurm head node (scontrol status ${job_nodes_status})." >&2
+  exit "${job_nodes_status}"
+fi
+if [ -z "${head_node}" ]; then
+  echo "Failed to resolve the Slurm head node: scontrol returned no nodes." >&2
+  exit 1
+fi
+
+export COSMOS_S3_PROFILE_PATH="/creds/s3_creds"
+export COSMOS_AZURE_PROFILE_PATH="/creds/azure_creds"
+export COSMOS_CURATOR_RAY_SLURM_JOB=True
+export HEAD_NODE_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+export HEAD_NODE_ADDR=$head_node
+export PRIMARY_NODE_HOSTNAME=$head_node
+export PRIMARY_NODE_PORT=$HEAD_NODE_PORT
+export RAY_STOP_RETRIES_AFTER={{stop_retries_after}}
+export COSMOS_CURATOR_RAY_IO_SLOTS_PER_NODE={{ray_io_slots_per_node}}
+# Remove TQDM spam from log files, tqdm is not needed for sbatch jobs
+export TQDM_MININTERVAL=9000
+
+# Scrub launcher activation state inherited by sbatch before srun enters the container.
+unset {{ launcher_env_vars_to_unset | join(' ') }}
+{% if launcher_env_prefixes_to_unset %}
+for launcher_env_var in {% for prefix in launcher_env_prefixes_to_unset %}${!{{ prefix }}@}{% if not loop.last %} {% endif %}{% endfor %}; do
+  unset "$launcher_env_var"
+done
+{% endif %}
+
+export SCRIPT_FILE=$(realpath "$0")
+export SCRIPT_FOLDER=$(dirname "$(realpath "$SCRIPT_FILE")")
+echo "This slurm script is located in folder: $SCRIPT_FOLDER"
+
+# Export container environment variables
+{% for env_var, value in env_vars.items() %}
+export {{ env_var }}="{{ value }}"
+{% endfor %}
+
+{% if source_environment_file %}
+if [ -f "{{source_environment_file}}" ]; then
+  set -a
+  source "{{source_environment_file}}"
+  source_environment_status=$?
+  set +a
+  if [ "${source_environment_status}" -ne 0 ]; then
+    echo "Failed to source {{source_environment_file}} (status ${source_environment_status})." >&2
+    exit "${source_environment_status}"
+  fi
+fi
+{% endif %}
+
+echo "HEAD_NODE_ADDR=${HEAD_NODE_ADDR}"
+echo "HEAD_NODE_PORT=${HEAD_NODE_PORT}"
+echo "SLURMD_NODENAME=${SLURMD_NODENAME}"
+echo "WORLD_SIZE=${WORLD_SIZE}"
+
+# Generate a metrics service discovery file for Prometheus
+_SLURM_JOB_NODELIST_FILE="{{job_artifact_path}}/tmp/hostnames_${SLURM_JOB_ID}.txt"
+if [ "{{enable_metrics_scraping}}" == "yes" ]; then
+  # prepare the node list file
+  mkdir -p {{job_artifact_path}}/tmp/
+  scontrol show hostnames $SLURM_JOB_NODELIST > $_SLURM_JOB_NODELIST_FILE
+  # generate the metrics discovery file
+  python {{job_artifact_path}}/prometheus_service_discovery.py \
+    --path "{{prometheus_service_discovery_path}}/prometheus_service_discovery_${SLURM_JOB_ID}.json" \
+    --job-user $SLURM_JOB_USER \
+    --job-id $SLURM_JOB_ID \
+    --job-name $SLURM_JOB_NAME \
+    --hostfile $_SLURM_JOB_NODELIST_FILE \
+    --port "${XENNA_RAY_METRICS_PORT:-9002}"
+fi
+
+cleanup_on_exit() {
+  local exit_status=$?
+  echo "Cleaning up any mess ..."
+  if [ "{{enable_metrics_scraping}}" == "yes" ]; then
+    rm -f $_SLURM_JOB_NODELIST_FILE
+    rm -f "{{prometheus_service_discovery_path}}/prometheus_service_discovery_${SLURM_JOB_ID}.json"
+  fi
+{% if host_cleanup_script %}
+  srun --mpi=none --nodes={{num_nodes}} --ntasks={{num_nodes}} --ntasks-per-node=1 bash {{host_cleanup_script}} || echo "Host cleanup failed" >&2
+{% endif %}
+  return "$exit_status"
+}
+trap cleanup_on_exit EXIT
+trap 'exit 143' SIGTERM
+trap 'exit 130' SIGINT
+
+{% if prepare_node_local_mounts and node_local_mount_sources %}
+echo "Preparing node-local mount source paths..."
+srun --mpi=none --nodes={{num_nodes}} --ntasks={{num_nodes}} --ntasks-per-node=1 bash -lc '
+{% for node_local_mount_source in node_local_mount_sources %}
+mkdir -p "{{node_local_mount_source}}"
+{% endfor %}
+'
+node_local_mount_status=$?
+if [ "${node_local_mount_status}" -ne 0 ]; then
+  echo "Failed to prepare node-local mount paths (srun status ${node_local_mount_status})." >&2
+  exit "${node_local_mount_status}"
+fi
+{% endif %}
+
+{% if host_setup_script %}
+source {{host_setup_script}}
+host_setup_status=$?
+if [ "${host_setup_status}" -ne 0 ]; then
+  exit "${host_setup_status}"
+fi
+{% if num_nodes > 1 %}
+srun --mpi=none --nodes={{num_nodes - 1}} --ntasks={{num_nodes - 1}} --ntasks-per-node=1 --exclude="$SLURMD_NODENAME" bash {{host_setup_script}}
+host_setup_status=$?
+if [ "${host_setup_status}" -ne 0 ]; then
+  exit "${host_setup_status}"
+fi
+{% endif %}
+{% endif %}
+
+# Actual run command
+echo "$(date) - Calling srun..."
+
+srun \
+  --mpi=none \
+  --container-writable \
+  --no-container-mount-home \
+  --no-container-remap-root \
+  --container-image {{container_image}} \
+  --container-mounts {{container_mounts}} \
+  --container-env {{ container_env_keys | join(',') }} \
+  bash -c {{container_command}} _ {{command}}
+srun_status=$?
+
+echo "$(date) - Srun exited with status ${srun_status}."
+exit "${srun_status}"

@@ -1,0 +1,203 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[project]
+name = "cosmos_curator"
+dynamic = ["version"]
+description = "Cosmos Curator"
+readme = "README.md"
+authors = [
+    {name = "NVIDIA Corporation"},
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# Pixi environments and standalone client installs share the Python 3.13 baseline.
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "attrs",
+    "click>=8.4.1",
+    "fabric>=3.2.2,<4.0.0",
+    "foxglove-schemas-protobuf",
+    "huggingface_hub",
+    "jinja2",
+    "loguru",
+    "mcap (>=1.3.1,<2.0.0)",
+    "multidict>=6.6.3,<7",
+    "ngcsdk",
+    "numpy",
+    "psutil",
+    "protobuf>=5,<7",
+    "pyarrow",
+    "pydantic>=2.12,<3",
+    "pyopenssl",
+    "pyyaml>=6.0.2,<7",
+    "requests>=2.32.3,<3",
+    "rich>=14.0.0,<16",
+    "tomli>=2.2.1",
+    "tqdm>=4.67.1,<5",
+    "typer>=0.21.0",
+    "urllib3>=1.26.18,<3"
+]
+classifiers = [
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+[project.urls]
+Homepage = "https://github.com/nvidia-cosmos/cosmos-curate"
+Repository = "https://github.com/nvidia-cosmos/cosmos-curate.git"
+
+[project.scripts]
+cosmos-curator = 'cosmos_curator.client.cli:cosmos_curator'
+
+[build-system]
+requires = ["setuptools==80.7.1", "setuptools-scm[simple]>=8", "jinja2>=3.1.6", "tomli>=2.2.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+# Non-editable builds stage the complete package tree, so retain every
+# non-Python asset without maintaining a second file manifest here.
+"cosmos_curator" = ["**/*"]
+
+[tool.setuptools_scm]
+local_scheme = "no-local-version"
+
+[tool.coverage.run]
+omit = [
+    "tests/*",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+indent-width = 4
+exclude = [
+    # Markdown formatting is experimental in Ruff and requires preview mode.
+    "*.md",
+    "build/",
+    "dist/",
+    "cosmos-xenna/",
+    "cosmos_curator/models/internvideo2_multi_modality/",
+]
+
+[tool.ruff.lint]
+# Do not add more, help to reduce
+# Ignore FIX002 Line contains TODO and related TD002, TD003
+# Later C901, PLR0912, PLR0913, PLR0915
+ignore = ["D203", "D213", "FIX002", "S101", "TD002", "TD003", "N806",
+          "COM812", "TRY003", "RUF200", "TC001", "PLE1205"]
+select = ["ALL"]
+extend-select = ["I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["INP001", "SLF001", "PLR2004", "PLR0913"]
+"cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py" = ["ALL"]
+
+# Uploaded into a Slurm run directory and run by a node's own python3. See the onnode package docstring for why
+# this floor exists; do not raise it to match the project.
+[tool.ruff.per-file-target-version]
+"cosmos_curator/client/slurm_cli/managed_ray/onnode/*.py" = "py38"
+
+[tool.ruff.lint.isort]
+known-first-party = ["cosmos_curator", "cosmos_xenna"]
+
+[tool.mypy]
+allow_redefinition = false
+allow_untyped_globals = false
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+no_implicit_reexport = true
+strict_equality = true
+strict_optional = true
+python_version = '3.13'
+warn_no_return = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_ignores = false
+disable_error_code = ["override"]
+files = ["cosmos_curator"]
+exclude = [
+    "build/",
+    "dist/",
+    "cosmos-xenna/",
+    "cosmos_curator/models/internvideo2_multi_modality/",
+    "cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py",
+    "cosmos_curator/pipelines/video/utils/vision_process.py",
+    "cosmos_curator/pipelines/video/utils/nvcodec_utils.py",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "cosmos_curator.models.internvideo2_multi_modality.*",
+    "cosmos_curator.pipelines.video.super_resolution.inference_seedvr2_window",
+    "cosmos_curator.pipelines.video.utils.*",
+    "cudf.*",
+    "cuml.*",
+    "cupy.*",
+    # mcap 1.4.0's writer imports .__init__, which mypy maps as mcap.__init__ in addition to mcap.
+    # Remove this once upstream fixes that import.
+    "mcap.writer",
+    "pylibraft.*",
+    "raft_dask.*",
+]
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = [
+    "diffusers",
+    "diffusers.*",
+    "lance",
+    "lance.fragment",
+    "ngcbase.errors",
+    "ngcsdk",
+    "pyarrow",
+    "pyarrow.*",
+    "scipy.ndimage",
+    "scipy.spatial.transform",
+    "registry.api.image",
+    "registry.api.models",
+    "vllm",
+    "vllm.*",
+    "vllm_omni",
+    "vllm_omni.*",
+    "av",
+    "av.*",
+    "google.protobuf",
+    "google.protobuf.*",
+    "foxglove_schemas_protobuf",
+    "foxglove_schemas_protobuf.*",
+    "hydra4",
+    "hydra4.*",
+    "pypcd4",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cosmos_curator.core.sensors.utils.mcap",
+]
+warn_return_any = false

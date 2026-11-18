@@ -1,0 +1,380 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the Ray Data splitting pipeline execution helpers."""
+
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+import pytest
+import ray
+from ray.data import ActorPoolStrategy, TaskPoolStrategy
+
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
+from cosmos_curator.pipelines.ray_data.video_split import pipeline as _pipeline
+from cosmos_curator.pipelines.ray_data.video_split.config import (
+    ResolvedVideoSplitConfig,
+    resolve_video_split_config_data,
+)
+
+
+def _deep_merge(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    for key, value in source.items():
+        if isinstance(target.get(key), dict) and isinstance(value, Mapping):
+            _deep_merge(target[key], value)  # type: ignore[arg-type]
+        else:
+            target[key] = value
+
+
+def _config(**overrides: Any) -> ResolvedVideoSplitConfig:  # noqa: ANN401
+    raw: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "video_split",
+        "input": {"video_path": "/input"},
+        "output": {"clip_path": "/output"},
+    }
+    _deep_merge(raw, overrides)
+    return resolve_video_split_config_data(raw).config
+
+
+class RecordingDataset:
+    """Small stand-in for ``ray.data.Dataset`` that records map calls."""
+
+    def __init__(self) -> None:
+        """Initialize the call recorder."""
+        self.map_calls: list[tuple[object, dict[str, Any]]] = []
+
+    def map(self, fn: object, **kwargs: Any) -> "RecordingDataset":  # noqa: ANN401
+        """Record a Ray Data map call."""
+        self.map_calls.append((fn, kwargs))
+        return self
+
+    def flat_map(self, fn: object, **kwargs: Any) -> "RecordingDataset":  # noqa: ANN401
+        """Record a Ray Data flat_map call."""
+        self.map_calls.append((fn, kwargs))
+        return self
+
+
+def test_caption_vllm_config_uses_resolved_batch_size() -> None:
+    """Caption batch size comes from the resolved config."""
+    config = _pipeline._caption_vllm_config(_config(caption={"batch_size": 9}))
+
+    assert config.model_variant == "qwen"
+    assert config.batch_size == 9
+
+
+def test_caption_vllm_config_defaults_to_model_preprocessing() -> None:
+    """Caption preprocess mode defaults to model-side preprocessing."""
+    config = _pipeline._caption_vllm_config(_config())
+
+    assert config.preprocess_mode == PreprocessMode.MODEL
+
+
+def test_caption_vllm_config_honors_preprocess_mode_override() -> None:
+    """A curator preprocess_mode in the resolved config reaches the vLLM config."""
+    config = _pipeline._caption_vllm_config(_config(caption={"preprocess_mode": "curator"}))
+
+    assert config.preprocess_mode == PreprocessMode.CURATOR
+
+
+def test_caption_workers_use_downloaded_gpu_count() -> None:
+    """Caption worker max is derived from model-download cluster discovery."""
+    assert _pipeline._caption_workers_from_downloaded_gpus(8, None) == 8
+    assert (
+        _pipeline._caption_workers_from_downloaded_gpus(8, _pipeline.VllmConfig(model_variant="qwen", num_gpus=2)) == 4
+    )
+
+
+def test_configure_ray_data_progress_sets_all_progress_flags() -> None:
+    """Progress disabling should suppress bars and execution-start banners."""
+    ctx = ray.data.DataContext.get_current()
+    previous = {
+        "enable_progress_bars": ctx.enable_progress_bars,
+        "enable_operator_progress_bars": ctx.enable_operator_progress_bars,
+        "enable_rich_progress_bars": ctx.enable_rich_progress_bars,
+        "print_on_execution_start": ctx.print_on_execution_start,
+        "use_ray_tqdm": ctx.use_ray_tqdm,
+    }
+    try:
+        _pipeline._configure_ray_data_progress(progress=False)
+        assert ctx.enable_progress_bars is False
+        assert ctx.enable_operator_progress_bars is False
+        assert ctx.enable_rich_progress_bars is False
+        assert ctx.print_on_execution_start is False
+        assert ctx.use_ray_tqdm is False
+
+        _pipeline._configure_ray_data_progress(progress=True)
+        assert ctx.enable_progress_bars is True
+        assert ctx.enable_operator_progress_bars is True
+        assert ctx.enable_rich_progress_bars is True
+        assert ctx.print_on_execution_start is True
+        assert ctx.use_ray_tqdm is False
+    finally:
+        for name, value in previous.items():
+            setattr(ctx, name, value)
+
+
+def test_download_slots_are_capped_by_input_video_count() -> None:
+    """Small runs should not ask Ray for more read/split tasks than inputs."""
+    assert _pipeline._download_slots_for_video_count(num_videos=0, num_nodes=8) == 0
+    assert _pipeline._download_slots_for_video_count(num_videos=1, num_nodes=8) == 1
+    assert _pipeline._download_slots_for_video_count(num_videos=10, num_nodes=1) == 10
+    assert _pipeline._download_slots_for_video_count(num_videos=100, num_nodes=2) == 32
+
+
+def test_required_model_ids_are_gated_by_selected_features(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Download only the models needed by the selected split and captioning features."""
+    monkeypatch.setattr(_pipeline, "transnetv2_model_ids", lambda: ["transnetv2"])
+    monkeypatch.setattr(_pipeline, "qwen_model_id", lambda: "qwen")
+
+    assert _pipeline._required_model_ids(_config(), generate_captions=True) == ["transnetv2", "qwen"]
+    assert _pipeline._required_model_ids(
+        _config(split={"method": "fixed_stride"}),
+        generate_captions=True,
+    ) == ["qwen"]
+    assert (
+        _pipeline._required_model_ids(
+            _config(split={"method": "fixed_stride"}, caption={"enabled": False}),
+            generate_captions=False,
+        )
+        == []
+    )
+
+
+def test_run_config_downloads_models_before_ray_startup_and_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model download side effects must run before Ray startup."""
+    events: list[str] = []
+
+    def fake_download_models(_model_ids: list[str], _model_weights_path: str) -> int:
+        events.append("download")
+        return 1
+
+    def fake_required_model_ids(_config: ResolvedVideoSplitConfig, *, generate_captions: bool) -> list[str]:
+        del generate_captions
+        return ["model"]
+
+    monkeypatch.setattr(_pipeline, "assert_ffmpeg_supports_h264", lambda: events.append("ffmpeg"))
+    monkeypatch.setattr(_pipeline, "_required_model_ids", fake_required_model_ids)
+    monkeypatch.setattr(_pipeline, "download_models", fake_download_models)
+    monkeypatch.setattr(_pipeline, "qwen_model_source", lambda: events.append("qwen_source") or "/models/qwen")
+    monkeypatch.setattr(_pipeline.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(_pipeline.ray, "init", lambda **_kwargs: events.append("ray_init"))
+
+    def fake_configure_ray_data_progress(*, progress: bool) -> None:
+        del progress
+        events.append("progress")
+
+    def fake_discover_videos(_input_path: str, *, limit: int | None = None) -> list[str]:
+        assert limit is None
+        events.append("discover")
+        return []
+
+    monkeypatch.setattr(_pipeline, "_configure_ray_data_progress", fake_configure_ray_data_progress)
+    monkeypatch.setattr(_pipeline, "_discover_videos", fake_discover_videos)
+
+    assert _pipeline.run_config(_config()) == 0
+    assert events == ["ffmpeg", "download", "qwen_source", "ray_init", "progress", "discover"]
+
+
+def test_run_config_uses_downloaded_gpu_count_for_caption_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The caption pool ceiling comes from the model-download GPU count."""
+    ds = RecordingDataset()
+    captured_caption_kwargs: dict[str, object] = {}
+
+    def fake_required_model_ids(_config: ResolvedVideoSplitConfig, *, generate_captions: bool) -> list[str]:
+        del generate_captions
+        return ["qwen"]
+
+    def fake_configure_ray_data_progress(*, progress: bool) -> None:
+        del progress
+
+    def fake_discover_videos(_input_path: str, *, limit: int | None = None) -> list[str]:
+        assert limit is None
+        return ["/input/a.mp4"]
+
+    def fake_caption_window_rows(dataset: RecordingDataset, **kwargs: object) -> RecordingDataset:
+        captured_caption_kwargs.update(kwargs)
+        return dataset
+
+    monkeypatch.setattr(_pipeline, "assert_ffmpeg_supports_h264", lambda: None)
+    monkeypatch.setattr(_pipeline, "_required_model_ids", fake_required_model_ids)
+    monkeypatch.setattr(_pipeline, "download_models", lambda _model_ids, _model_weights_path: 8)
+    monkeypatch.setattr(_pipeline, "qwen_model_source", lambda: "/models/qwen")
+    monkeypatch.setattr(_pipeline.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(_pipeline.ray, "init", lambda **_kwargs: None)
+    monkeypatch.setattr(_pipeline.ray, "nodes", lambda: [{"Alive": True, "Resources": {"CPU": 8, "GPU": 8}}])
+    monkeypatch.setattr(_pipeline.ray, "cluster_resources", lambda: pytest.fail("unexpected GPU resource query"))
+    monkeypatch.setattr(_pipeline.ray.data, "from_items", lambda _items: ds)
+    monkeypatch.setattr(_pipeline, "_configure_ray_data_progress", fake_configure_ray_data_progress)
+    monkeypatch.setattr(_pipeline, "_discover_videos", fake_discover_videos)
+    monkeypatch.setattr(_pipeline, "caption_window_rows", fake_caption_window_rows)
+    monkeypatch.setattr(_pipeline, "write_captioned_metadata_and_summary", lambda *_args, **_kwargs: 1)
+
+    assert _pipeline.run_config(_config()) == 1
+    assert captured_caption_kwargs["caption_workers"] == 8
+
+
+def test_apply_split_stage_wires_transnetv2_actor_resources() -> None:
+    """TransNetV2 should run as a stateful Ray Data actor with declared CPU/GPU resources."""
+    config = _config(split={"limit_clips": 7})
+    ds = RecordingDataset()
+
+    result = _pipeline._apply_split_stage(ds, config, download_slots=3)  # type: ignore[arg-type]
+
+    assert result is ds
+    fn, kwargs = ds.map_calls[0]
+    assert fn is _pipeline.TransNetV2Splitter
+    assert kwargs["fn_constructor_kwargs"] == {
+        "threshold": 0.4,
+        "min_length_s": 2.0,
+        "min_length_frames": 48,
+        "max_length_s": 60.0,
+        "max_length_mode": "stride",
+        "crop_s": 0.5,
+        "num_decode_cpus_per_worker": 3,
+        "limit_clips": 7,
+    }
+    assert kwargs["num_cpus"] == 3
+    assert kwargs["num_gpus"] == 0.25
+    assert isinstance(kwargs["compute"], ActorPoolStrategy)
+    assert kwargs["compute"].min_size == 1
+    assert kwargs["compute"].max_size == 3
+    assert kwargs["compute"].initial_size == 1
+    assert (
+        kwargs["runtime_env"].get("py_executable")
+        == "pixi run --as-is -e default python -m cosmos_curator.core.utils.hf_module_cache"
+    )
+    assert kwargs["runtime_env"].get("env_vars") == {
+        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
+        "VLLM_CACHE_ROOT": "/tmp/vllm",  # noqa: S108
+    }
+    assert kwargs["scheduling_strategy"] == "DEFAULT"
+
+
+def test_apply_split_stage_converts_null_clip_limit_to_splitter_sentinel() -> None:
+    """The resolved config renders null, while splitters still receive 0 for unlimited."""
+    config = _config()
+    ds = RecordingDataset()
+
+    _pipeline._apply_split_stage(ds, config, download_slots=3)  # type: ignore[arg-type]
+
+    _, kwargs = ds.map_calls[0]
+    assert config.split.limit_clips is None
+    assert kwargs["fn_constructor_kwargs"]["limit_clips"] == 0
+
+
+def test_apply_split_stage_keeps_fixed_stride_as_task_pool() -> None:
+    """Fixed-stride splitting remains a stateless task transform."""
+    config = _config(split={"method": "fixed_stride"})
+    ds = RecordingDataset()
+
+    result = _pipeline._apply_split_stage(ds, config, download_slots=2)  # type: ignore[arg-type]
+
+    assert result is ds
+    _, kwargs = ds.map_calls[0]
+    assert kwargs["num_cpus"] == 0.25
+    assert isinstance(kwargs["compute"], TaskPoolStrategy)
+    assert kwargs["compute"].size == 2
+    assert "runtime_env" not in kwargs
+
+
+def test_validate_transnetv2_cluster_resources_fails_without_gpu() -> None:
+    """Default TransNetV2 splitting should fail fast when model download found no GPUs."""
+    with pytest.raises(ValueError, match="TransNetV2 splitting requires visible GPUs"):
+        _pipeline._validate_transnetv2_cluster_resources(_config(), total_visible_gpus=0)
+
+
+def test_validate_transnetv2_cluster_resources_accepts_node_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TransNetV2 only needs one live node that can fit one splitter worker."""
+    monkeypatch.setattr(
+        _pipeline.ray,
+        "nodes",
+        lambda: [
+            {"Alive": True, "Resources": {"CPU": 2, "GPU": 8}},
+            {"Alive": True, "Resources": {"CPU": 3, "GPU": 0.25}},
+        ],
+    )
+
+    _pipeline._validate_transnetv2_cluster_resources(_config(), total_visible_gpus=8)
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "nodes"),
+    [
+        (
+            {"split": {"transnetv2": {"gpus_per_worker": 2.0}}},
+            [
+                {"Alive": True, "Resources": {"CPU": 16, "GPU": 1}},
+                {"Alive": True, "Resources": {"CPU": 16, "GPU": 1}},
+            ],
+        ),
+        (
+            {"split": {"transnetv2": {"frame_decode_cpus_per_worker": 16}}},
+            [{"Alive": True, "Resources": {"CPU": 8, "GPU": 1}}],
+        ),
+        (
+            {},
+            [
+                {"Alive": False, "Resources": {"CPU": 3, "GPU": 0.25}},
+                {"Alive": True, "Resources": {"CPU": 2, "GPU": 0.25}},
+            ],
+        ),
+    ],
+)
+def test_validate_transnetv2_cluster_resources_rejects_unschedulable_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+    config_overrides: dict[str, Any],
+    nodes: list[dict[str, object]],
+) -> None:
+    """Aggregate GPUs are not enough when no single node can fit a splitter worker."""
+    monkeypatch.setattr(_pipeline.ray, "nodes", lambda: nodes)
+
+    with pytest.raises(ValueError, match="at least one live Ray node"):
+        _pipeline._validate_transnetv2_cluster_resources(_config(**config_overrides), total_visible_gpus=8)
+
+
+def test_validate_transnetv2_cluster_resources_skips_fixed_stride() -> None:
+    """Fixed-stride splitting should remain usable on CPU-only Ray clusters."""
+    _pipeline._validate_transnetv2_cluster_resources(
+        _config(split={"method": "fixed_stride"}),
+        total_visible_gpus=0,
+    )
+
+
+def test_module_main_resolves_config_and_set_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The module CLI accepts only a config file plus small --set overrides."""
+    captured: dict[str, ResolvedVideoSplitConfig] = {}
+
+    def fake_run_config(config: ResolvedVideoSplitConfig) -> int:
+        captured["config"] = config
+        return 3
+
+    config_path = tmp_path / "split.yaml"
+    config_path.write_text(
+        """schema_version: 1
+kind: video_split
+input:
+  video_path: /videos
+output:
+  clip_path: /clips
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_pipeline, "run_config", fake_run_config)
+
+    assert _pipeline.main([str(config_path), "--set", "caption.enabled=false"]) == 0
+    assert captured["config"].input.video_path == "/videos"
+    assert captured["config"].caption.enabled is False

@@ -1,0 +1,33 @@
+### Common Configuration ###
+# Workaround https://github.com/bazelbuild/bazel/issues/23743
+common --experimental_merged_skyframe_analysis_execution=false
+# Disable Aspect Build telemetry collection
+common --repo_env=ASPECT_TOOLS_TELEMETRY=-all
+# Set rules_python repo debug verbosity to ERROR
+common --repo_env=RULES_PYTHON_REPO_DEBUG_VERBOSITY=ERROR
+## rules_python venv bootstrap (rules_python 2.x direction; system_python is the legacy mode being phased out).
+# Use the script-based stage-1 launcher (a `#!/usr/bin/env bash` wrapper that invokes the interpreter inside the
+# binary's own venv) instead of the legacy `system_python` launcher (a `#!/usr/bin/env python3` script).
+common --@rules_python//python/config_settings:bootstrap_impl=script
+# Materialize the venv's bin/python3 as a regular placeholder file (recreated at runtime) rather than a build-time
+# declared symlink to the hermetic interpreter This is the upstream-supported mode for packaging py_binary venvs into
+# tar/OCI images.
+common --@rules_python//python/config_settings:venvs_use_declare_symlink=no
+# Require explicit __init__.py for python packages instead of letting Bazel synthesize empty ones into runfiles.
+common --@rules_python//python/config_settings:incompatible_default_to_explicit_init_py=true
+
+
+### Build Configuration ###
+# Prune unused srcs from tar action cache keys
+build --@aspect_bazel_lib//lib:tar_compute_unused_inputs
+# Prevent __pycache__ pollution in workspace
+build --action_env=PYTHONDONTWRITEBYTECODE=1
+# Persist the multi-GiB OCI pip dependency layer tarballs in bazel-out instead of re-fetching them from the
+# (disk/remote) cache on every build, which Build-without-the-Bytes would otherwise do for these intermediate outputs.
+build --remote_download_regex=.*(app_pip_.*_layer|gpu_core_layer)\.tar$
+# Prevent __pycache__ pollution in test sandbox
+build --test_env=PYTHONDONTWRITEBYTECODE=1
+
+# Workspace status stamping (STABLE_GIT_SHA in stable-status.txt). Without this, `bazel build` would silently drop
+# git-SHA stamping.
+build --workspace_status_command=tools/workspace_status.sh

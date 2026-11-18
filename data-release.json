@@ -1,0 +1,10 @@
+{
+  "repo_id": "lancel-nv/robodojo-push-t-raw",
+  "repo_type": "dataset",
+  "revision": null,
+  "status": "awaiting_visibility_confirmation_before_upload",
+  "episodes": 502,
+  "success": 200,
+  "failure": 302,
+  "format": "raw-only"
+}

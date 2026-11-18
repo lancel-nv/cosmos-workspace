@@ -1,0 +1,66 @@
+resources:
+  requests:
+    cpu: "4"
+    memory: "10Gi"
+    nvidia.com/gpu: 1
+  limits:
+    cpu: "16"
+    memory: "120Gi"
+    nvidia.com/gpu: 1
+
+metrics:
+  enabled: false
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: monitoring
+imagePullSecret:
+  create: true
+  dockerConfigJson:
+    registry: "nvcr.io"
+    username: "$oauthtoken"
+    password: "" # FILL_IN your NGC API key here, or provide on helm deploy with --set imagePullSecret.dockerConfigJson.password=${API_KEY}
+image:
+  pullPolicy: IfNotPresent
+  repository: "nvcr.io/FILL_IN/cosmos-curator"
+  tag: "FILL_IN"
+ngcCatalog:
+  secret:
+    enabled: true
+    name: "ngc-secret"
+    key: ""  # FILL_IN your NGC API key here, or provide on helm deploy with --set ngcCatalog.secret.key=${MODEL_MANAGER_KEY}
+    org: "FILL_IN"  # Set your NGC organization here
+persistence:
+  enabled: false
+  storageClass: "fast-ssd"
+  size: 800Gi
+  retentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Retain
+
+# networkPolicy:
+#   # Enabled by default for standalone clusters.
+#   # Set false for NVCF deployments (NVCF rejects NetworkPolicy resources).
+#   enabled: true
+#
+#   # Peers allowed to reach the HTTP invocation endpoint (curator.port).
+#   # Empty = fail-closed. Add an API gateway entry here to open it:
+#   # allowInvocationFrom:
+#   #   - namespaceSelector:
+#   #       matchLabels:
+#   #         kubernetes.io/metadata.name: api-gateway
+#   allowInvocationFrom: []
+#
+#   # This values file enables metrics.serviceMonitor (Prometheus Operator
+#   # scraping pod-0 via the ClusterIP service) and disables the bundled
+#   # collector. With networkPolicy.enabled=true that cross-namespace scrape
+#   # is blocked by default — add an extraIngress rule for it:
+#   # extraIngress:
+#   #   - ports:
+#   #       - port: 9002
+#   #         protocol: TCP
+#   #     from:
+#   #       - namespaceSelector:
+#   #           matchLabels:
+#   #             kubernetes.io/metadata.name: monitoring
+#   extraIngress: []

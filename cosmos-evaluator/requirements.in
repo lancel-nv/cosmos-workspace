@@ -1,0 +1,65 @@
+# This file is used to manage Python dependencies via pip.
+#
+# The current design choice is to only pin when necessary. Otherwise, allow updating to the latest version.
+# The tradeoff here is we risk breaking changes if/when a dependency version updates, but the benefit is we stay at the
+# forefront of new features and bug fixes.
+#
+# Add new direct (not transitive!) dependencies below (pin versions as needed).
+#
+# Run `dazel run //:requirements.update` to update requirements.txt without upgrading versions that meet requirements.
+#
+# Run `dazel run //:requirements.update -- --upgrade` to upgrade to the latest allowed versions.
+#
+# Run `dazel test //:requirements.test` to test the requirements.txt file is up-to-date.
+aioboto3
+aiofiles
+aiohttp
+asyncpg
+attrs>=25.3.0
+azure-core
+azure-storage-blob
+boto3
+botocore
+certifi
+cloudpickle
+docker
+einops
+fastapi
+filelock
+fvcore
+httpx
+huggingface_hub
+lcov_cobertura
+matplotlib
+multi-storage-client[boto3]
+multidict
+mypy
+numba>=0.57.0
+numpy
+omegaconf>=2.3.0
+# Starting with onnxruntime-gpu 1.27.0 the default PyPI wheel links against the CUDA 13 runtime (libcudart.so.13), but
+# the service images ship the CUDA 12.8 runtime (see torch==...+cu128 below). 1.26.x is the last release whose default
+# PyPI wheel targets CUDA 12.x. Lift this cap only when the image base moves to CUDA 13.
+onnxruntime-gpu<1.27.0
+openai>=1.40.0
+pydantic
+pydantic-settings
+pytest
+pytest-asyncio
+python-dotenv
+pyyaml
+safetensors
+scipy
+shapely
+starlette
+testcontainers
+timm>=1.0.15
+torch==2.10.0+cu128
+torchinfo>=1.8.0
+torchvision==0.25.0+cu128
+tqdm
+transformers
+trimesh
+uvicorn
+webdataset
+yarl

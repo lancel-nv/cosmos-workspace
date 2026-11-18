@@ -1,0 +1,579 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MP4 frame indexes and metadata built from parsed tracks, PyAV probes, or published Arrow records."""
+
+import struct
+from fractions import Fraction
+from typing import Any, Self
+
+import attrs
+import numpy as np
+import numpy.typing as npt
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from cosmos_curator.core.sensors.data.video import VideoProbe
+from cosmos_curator.core.sensors.mp4.box_primitives import VIDEO_FOURCC_CODEC_NAMES
+from cosmos_curator.core.sensors.mp4.errors import UnindexableVideoError
+from cosmos_curator.core.sensors.mp4.moov_track import VideoTrack
+from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
+from cosmos_curator.core.sensors.utils.validation import AttrsAttribute, optional_int64_array
+
+_NS_PER_SECOND = 1_000_000_000
+
+type TimestampArray = npt.NDArray[np.int64] | np.ma.MaskedArray[Any, np.dtype[np.int64]]
+
+
+def video_track_sample_arrays(
+    video_track: VideoTrack,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64] | None, npt.NDArray[np.bool_]]:
+    """Return ``(dts_ticks, composition_offset_ticks, is_keyframe)`` in decode order.
+
+    Expand ``ctts`` runs into per-sample offsets, or return ``None`` when absent.
+    Without ``stss``, every sample is a keyframe. No edit-list shift or time-base
+    conversion is applied.
+    """
+    frame_count = len(video_track.dts_ticks)
+    composition_offsets = video_track.composition_offsets
+    composition_offset_ticks = (
+        None
+        if composition_offsets is None
+        else np.repeat(composition_offsets.sample_offsets, composition_offsets.sample_counts).astype(np.int64)
+    )
+    is_keyframe = (
+        video_track.is_keyframe if video_track.is_keyframe is not None else np.ones(frame_count, dtype=np.bool_)
+    )
+    return video_track.dts_ticks, composition_offset_ticks, is_keyframe
+
+
+#: elst's own media_rate_integer/media_rate_fraction pair for normal (1x) playback --
+#: see UnsupportedEditListError's own docstring for why only this rate is supported.
+_ELST_NORMAL_RATE = (1, 0)
+
+
+class UnsupportedEditListError(UnindexableVideoError):
+    """An ``edts/elst`` box this reader cannot map to ``edited_pts_ns``.
+
+    Only the common shape is applied: a single entry, playing at normal (1x) rate, with a
+    non-negative ``media_time`` (the lead-in the encoder buffered before presentation
+    starts, represented in ``edited_pts_ns`` by subtracting that amount). Multiple entries, an
+    empty edit (``media_time == -1``, meaning "insert a gap here"), a non-1x rate, or bytes
+    too short to even hold the shape being checked all describe an edit list this reader
+    refuses to guess at rather than silently produce a wrong shift.
+    """
+
+
+class InvalidTimeBaseError(UnindexableVideoError):
+    """A ``time_base_den`` of 0 -- a degenerate ``mdhd`` with ``timescale == 0`` -- can't convert ticks to ns."""
+
+
+def _edit_list_media_time_ticks(elst_bytes: bytes | None) -> int:
+    """Return the single supported ``elst`` entry's own ``media_time``, in the track's own timescale.
+
+    ``media_time`` is in the *media* (``mdhd``) timescale per ISO/IEC 14496-12 8.6.6 --
+    the same tick domain ``dts_ticks`` is already in, so the caller can convert it to
+    nanoseconds with the same ``time_base_num``/``time_base_den`` it already has, no
+    separate movie-timescale lookup needed. Returns 0 when *elst_bytes* is ``None``
+    (no edit list -- nothing to shift).
+
+    Raises:
+        UnsupportedEditListError: see that class's own docstring.
+
+    """
+    if elst_bytes is None:
+        return 0
+    try:
+        version = elst_bytes[8]
+        entry_count = struct.unpack_from(">I", elst_bytes, 12)[0]
+        if entry_count != 1:
+            msg = f"elst has {entry_count} entries -- only a single-entry edit list is supported"
+            raise UnsupportedEditListError(msg)
+        if version == 1:
+            _segment_duration, media_time, rate_integer, rate_fraction = struct.unpack_from(">Qqhh", elst_bytes, 16)
+        else:
+            _segment_duration, media_time, rate_integer, rate_fraction = struct.unpack_from(">Iihh", elst_bytes, 16)
+    except (struct.error, IndexError) as exc:
+        msg = f"elst ({len(elst_bytes)} byte(s)) is truncated or corrupt -- cannot read its own entries"
+        raise UnsupportedEditListError(msg) from exc
+    if media_time < 0:
+        msg = "elst's single entry is an empty edit (media_time == -1) -- not supported"
+        raise UnsupportedEditListError(msg)
+    if (rate_integer, rate_fraction) != _ELST_NORMAL_RATE:
+        msg = f"elst's single entry plays at rate {rate_integer}.{rate_fraction} -- only normal (1x) rate is supported"
+        raise UnsupportedEditListError(msg)
+    return int(media_time)
+
+
+def _edited_pts_ns(
+    pts_ns: npt.NDArray[np.int64],
+    *,
+    time_base_num: int,
+    time_base_den: int,
+    elst_bytes: bytes | None,
+) -> npt.NDArray[np.int64]:
+    """Apply the supported edit shift, sharing unchanged PTS.
+
+    Raises:
+        UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+    """
+    media_time_ticks = _edit_list_media_time_ticks(elst_bytes)
+    shift_ns = int(media_time_ticks) * int(time_base_num) * _NS_PER_SECOND // int(time_base_den)
+    return pts_ns if shift_ns == 0 else pts_ns - shift_ns
+
+
+#: Bounds `avg_frame_rate`'s denominator (after `Fraction.limit_denominator`) so its
+#: numerator fits `VIDEO_METADATA_SCHEMA`'s int32 field. Motivated by a real video
+#: (frame_count=31525, timescale=1000000) that overflowed int32 without this bound.
+_AVG_FRAME_RATE_MAX_DENOMINATOR = 100_000
+
+
+def _ticks_to_ns(ticks: npt.NDArray[np.int64], time_base_num: int, time_base_den: int) -> npt.NDArray[np.int64]:
+    """Convert a tick array to nanoseconds: ``ticks * time_base_num * 1e9 // time_base_den``.
+
+    Integer arithmetic throughout, never a per-sample Python loop. The
+    intermediate product goes through Python's arbitrary-precision ints
+    (``object``-dtype array), not straight ``int64``: at a ~1,000,000
+    timescale, ``ticks * time_base_num * 1e9`` alone overflows ``int64`` past
+    ~2.5 hours of media, even though the true nanosecond result comfortably
+    fits. The final cast back to ``int64`` is checked rather than trusted,
+    so a genuinely unrepresentable result raises instead of wrapping
+    silently.
+
+    This is the one real place this conversion happens: the result is
+    computed at read time, never persisted.
+
+    Raises:
+        InvalidTimeBaseError: *time_base_den* is 0.
+
+    """
+    if time_base_den == 0:
+        msg = f"time base denominator is 0 (time_base={time_base_num}/{time_base_den}) -- cannot convert ticks"
+        raise InvalidTimeBaseError(msg)
+    wide = ticks.astype(object) * int(time_base_num) * _NS_PER_SECOND // int(time_base_den)
+    result = wide.astype(np.int64)
+    if not np.array_equal(result.astype(object), wide):
+        msg = f"tick-to-nanosecond conversion overflowed int64 (time_base={time_base_num}/{time_base_den})"
+        raise OverflowError(msg)
+    return result
+
+
+def _stream_rate_stats(
+    frame_count: int, sample_sizes: npt.NDArray[np.int64], duration_ticks: int, timescale: int
+) -> tuple[Fraction, int]:
+    """Return ``(avg_frame_rate, bit_rate_bps)`` -- both zero for a zero-duration track.
+
+    The ratio is built from integers first, never through a float duration
+    intermediate: a real video, during this recipe's own real-S3 validation,
+    produced a numerator ~14x too large for ``VIDEO_METADATA_SCHEMA``'s int32
+    field when the duration was floated first.
+    """
+    if not duration_ticks or not timescale:
+        return Fraction(0), 0
+    avg_frame_rate = Fraction(frame_count * timescale, duration_ticks).limit_denominator(
+        _AVG_FRAME_RATE_MAX_DENOMINATOR
+    )
+    duration_seconds = duration_ticks / timescale
+    bit_rate_bps = int(int(sample_sizes.sum()) * 8 / duration_seconds)
+    return avg_frame_rate, bit_rate_bps
+
+
+@attrs.define(frozen=True)
+class Mp4FrameIndex:
+    """Frame index stored in decode order, with int64 nanosecond timestamps.
+
+    ``pts_ns`` is ``dts_ns`` plus composition offset; ``edited_pts_ns`` also applies
+    the supported playback edit shift. ``pts_sort_order[rank]`` gives the decode-order
+    sample index for a presentation rank without reordering the arrays. DTS and both
+    PTS arrays expose read-only views and may share buffers.
+
+    EOF/SOF/MOE are independently optional sensor timestamps, unaffected by container
+    time-base conversion or edit shifts. SOF is readout start; MOE is exposure midpoint,
+    may precede SOF, and is never inferred from SOF/EOF.
+
+    Entirely absent timing arrays are ``None``. Partial SOF/MOE use masked int64 arrays
+    (``True`` means unavailable); EOF must be complete when present.
+    """
+
+    dts_ticks: npt.NDArray[np.int64]
+    composition_offset_ticks: npt.NDArray[np.int64] | None  # None iff every row's own value is null
+    dts_ns: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view)
+    pts_ns: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view)
+    edited_pts_ns: npt.NDArray[np.int64] = attrs.field(converter=as_readonly_view)
+    composition_offset_ns: npt.NDArray[np.int64] | None  # None iff every row's own value is null
+    time_base_num: int
+    time_base_den: int
+    elst_bytes: bytes | None
+    pts_sort_order: npt.NDArray[np.int64]  # argsort(pts_ns) -- a decode-order-index permutation
+    keyframe_indices: npt.NDArray[np.int64]  # flatnonzero(is_keyframe), already sorted
+    is_keyframe: npt.NDArray[np.bool_]
+    offset: npt.NDArray[np.int64]
+    size: npt.NDArray[np.int64]
+    eof_ns: npt.NDArray[np.int64] | None = attrs.field(default=None, validator=optional_int64_array)
+    sof_ns: TimestampArray | None = attrs.field(default=None, validator=optional_int64_array)
+    moe_ns: TimestampArray | None = attrs.field(default=None, validator=optional_int64_array)
+
+    @eof_ns.validator
+    @sof_ns.validator
+    @moe_ns.validator
+    def _validate_camera_timing(self, attribute: AttrsAttribute, value: TimestampArray | None) -> None:
+        """Require supplied arrays to match the frame count; EOF cannot contain masked entries."""
+        if value is None:
+            return
+        if len(value) != len(self):
+            msg = f"{attribute.name} length must equal the frame count ({len(self)}), got {len(value)}"
+            raise ValueError(msg)
+        if attribute.name == "eof_ns" and isinstance(value, np.ma.MaskedArray) and np.any(value.mask):
+            msg = "eof_ns must be populated for every frame"
+            raise ValueError(msg)
+
+    def __len__(self) -> int:
+        """Return the sample count."""
+        return len(self.dts_ticks)
+
+    @classmethod
+    def _assemble(  # noqa: PLR0913 -- one argument per real field the two constructors don't already share
+        cls,
+        *,
+        dts_ticks: npt.NDArray[np.int64],
+        composition_offset_ticks: npt.NDArray[np.int64] | None,
+        is_keyframe: npt.NDArray[np.bool_],
+        offset: npt.NDArray[np.int64],
+        size: npt.NDArray[np.int64],
+        time_base_num: int,
+        time_base_den: int,
+        elst_bytes: bytes | None,
+        eof_ns: npt.NDArray[np.int64] | None = None,
+        sof_ns: TimestampArray | None = None,
+        moe_ns: TimestampArray | None = None,
+    ) -> Self:
+        """Mp4FrameIndex initializer.
+
+        Raises:
+            InvalidTimeBaseError: *time_base_den* is 0.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+        """
+        dts_ns = _ticks_to_ns(dts_ticks, time_base_num, time_base_den)
+        composition_offset_ns = (
+            None
+            if composition_offset_ticks is None
+            else _ticks_to_ns(composition_offset_ticks, time_base_num, time_base_den)
+        )
+        pts_ns = (
+            dts_ns
+            if composition_offset_ns is None or not np.any(composition_offset_ns)
+            else dts_ns + composition_offset_ns
+        )
+        edited_pts_ns = _edited_pts_ns(
+            pts_ns, time_base_num=time_base_num, time_base_den=time_base_den, elst_bytes=elst_bytes
+        )
+        return cls(
+            dts_ticks=dts_ticks,
+            composition_offset_ticks=composition_offset_ticks,
+            dts_ns=dts_ns,
+            pts_ns=pts_ns,
+            edited_pts_ns=edited_pts_ns,
+            composition_offset_ns=composition_offset_ns,
+            time_base_num=time_base_num,
+            time_base_den=time_base_den,
+            elst_bytes=elst_bytes,
+            pts_sort_order=np.argsort(pts_ns, kind="stable"),
+            keyframe_indices=np.flatnonzero(is_keyframe),
+            is_keyframe=is_keyframe,
+            offset=offset,
+            size=size,
+            eof_ns=eof_ns,
+            sof_ns=sof_ns,
+            moe_ns=moe_ns,
+        )
+
+    @classmethod
+    def from_frame_index_table(
+        cls, table: pa.Table, *, time_base_num: int, time_base_den: int, elst_bytes: bytes | None = None
+    ) -> Self:
+        """Build from a ``FRAME_INDEX_SCHEMA`` table and the video's accompanying metadata.
+
+        Pass ``time_base_num``, ``time_base_den``, and ``elst_bytes`` from ``Mp4Metadata``
+        to compute media and edited PTS once.
+
+        Raises:
+            ValueError: Composition offsets or EOF contain a mix of null and non-null values;
+                those columns must be all-null or fully populated. Partially missing SOF/MOE
+                are represented as masked int64 arrays without rounding through float64.
+            InvalidTimeBaseError: ``time_base_den`` is zero.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+        """
+        dts_ticks = table.column("dts_ticks").to_numpy()
+        composition_offset_column = table.column("composition_offset_ticks")
+        if composition_offset_column.null_count == len(table):
+            composition_offset_ticks: npt.NDArray[np.int64] | None = None
+        elif composition_offset_column.null_count != 0:
+            msg = (
+                f"composition_offset_ticks is null on {composition_offset_column.null_count} of {len(table)} "
+                "row(s) -- expected all-null or fully populated, never a mix"
+            )
+            raise ValueError(msg)
+        else:
+            composition_offset_ticks = composition_offset_column.to_numpy(zero_copy_only=False)
+        # Fill missing values before NumPy conversion to retain exact int64 values.
+        # The independent mask, not the fill value, represents unavailable timing.
+        timing: dict[str, TimestampArray | None] = {}
+        for name in ("eof_ns", "sof_ns", "moe_ns"):
+            column = table.column(name)
+            if column.null_count == len(table):
+                timing[name] = None
+            elif column.null_count:
+                if name == "eof_ns":
+                    msg = "eof_ns must be populated for every frame or entirely absent"
+                    raise ValueError(msg)
+                # The pinned NumPy stubs lack a typed masked-array constructor.
+                timing[name] = np.ma.MaskedArray(  # type: ignore[no-untyped-call]
+                    pc.fill_null(column, 0).to_numpy(), mask=column.is_null().to_numpy(), copy=False
+                )
+            else:
+                timing[name] = column.to_numpy()
+        return cls._assemble(
+            dts_ticks=dts_ticks,
+            composition_offset_ticks=composition_offset_ticks,
+            is_keyframe=table.column("is_keyframe").to_numpy(),
+            offset=table.column("offset").to_numpy(),
+            size=table.column("size").to_numpy(),
+            time_base_num=time_base_num,
+            time_base_den=time_base_den,
+            elst_bytes=elst_bytes,
+            eof_ns=timing["eof_ns"],
+            sof_ns=timing["sof_ns"],
+            moe_ns=timing["moe_ns"],
+        )
+
+    @classmethod
+    def from_video_probe(cls, probe: VideoProbe, *, elst_bytes: bytes | None = None) -> Self:
+        """Build a frame index from a PyAV probe.
+
+        Raises:
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+        """
+        return cls._assemble(
+            dts_ticks=probe.dts,
+            composition_offset_ticks=probe.composition_offset,
+            is_keyframe=probe.is_keyframe,
+            offset=probe.offset,
+            size=probe.size,
+            time_base_num=probe.time_base.numerator,
+            time_base_den=probe.time_base.denominator,
+            elst_bytes=elst_bytes,
+        )
+
+    @classmethod
+    def from_video_track(cls, video_track: VideoTrack) -> Self:
+        """Build a frame index from a parsed video track.
+
+        Raises:
+            InvalidTimeBaseError: *video_track*'s own ``timescale`` is 0.
+            UnsupportedEditListError: The edit list cannot be represented as a single shift.
+
+        """
+        dts_ticks, composition_offset_ticks, is_keyframe = video_track_sample_arrays(video_track)
+        return cls._assemble(
+            dts_ticks=dts_ticks,
+            composition_offset_ticks=composition_offset_ticks,
+            is_keyframe=is_keyframe,
+            offset=video_track.offset,
+            size=video_track.size,
+            time_base_num=1,
+            time_base_den=video_track.timescale,
+            elst_bytes=video_track.elst_bytes,
+        )
+
+
+@attrs.define(frozen=True)
+class Mp4Metadata:
+    """Typed mirror of one ``VIDEO_METADATA_SCHEMA`` row -- what the container states about the stream.
+
+    Fields libav does not report are ``None`` when PyAV built the row; the box walker fills them
+    from ``stsd``, ``mvhd``, and ``tkhd``.
+    """
+
+    track_id: int = attrs.field(
+        validator=attrs.validators.and_(attrs.validators.instance_of(int), attrs.validators.gt(0))
+    )
+    codec_name: str
+    extradata: bytes
+    time_base_num: int
+    time_base_den: int
+    frame_count: int
+    keyframe_count: int
+    width: int
+    height: int
+    avc_profile_idc: int | None
+    avc_constraint_flags: int | None
+    avc_level_idc: int | None
+    nal_length_size: int | None
+    chroma_format_idc: int | None
+    bit_depth_luma_minus8: int | None
+    bit_depth_chroma_minus8: int | None
+    buffer_size_db: int | None
+    max_bitrate_bps: int | None
+    avg_bitrate_bps: int | None
+    movie_creation_time: int | None
+    movie_modification_time: int | None
+    track_creation_time: int | None
+    track_modification_time: int | None
+    # VIDEO_METADATA_SCHEMA's own list<int32> comes back from a Lance/pyarrow row as a plain
+    # list -- converted to a tuple here so a frozen Mp4Metadata is actually immutable.
+    track_matrix: tuple[int, ...] | None = attrs.field(converter=attrs.converters.optional(tuple))
+    track_display_width: int | None
+    track_display_height: int | None
+    elst_bytes: bytes | None
+    # The source's top-level ftyp ahead of moov, verbatim, or None if it has none.
+    ftyp_bytes: bytes | None
+    avg_frame_rate_num: int
+    avg_frame_rate_den: int
+    bit_rate_bps: int
+    duration_ns: int
+    encoder_tag: str | None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> Self:
+        """Build from one real ``VIDEO_METADATA_SCHEMA`` row (e.g. ``read_video_record``'s metadata row)."""
+        return cls(**{field.name: row[field.name] for field in attrs.fields(cls)})
+
+    @classmethod
+    def from_video_track(cls, video_track: VideoTrack, *, ftyp_bytes: bytes | None) -> Self:
+        """Build directly from a real, already-parsed ``VideoTrack`` -- no sidecar round-trip.
+
+        ``encoder_tag`` stays ``None`` -- nothing in a ``VideoTrack`` states it. *ftyp_bytes* is
+        the source's ``ftyp``, which lies outside the ``moov`` a ``VideoTrack`` is parsed from.
+        """
+        sd = video_track.sample_description
+        avg_frame_rate, bit_rate_bps = _stream_rate_stats(
+            len(video_track.dts_ticks), video_track.size, video_track.duration, video_track.timescale
+        )
+        # Treat a zero timescale as unknown duration, matching the rate statistics.
+        duration_ns = (
+            0
+            if video_track.timescale == 0
+            else int(_ticks_to_ns(np.array([video_track.duration], dtype=np.int64), 1, video_track.timescale)[0])
+        )
+        return cls(
+            track_id=video_track.track_header.track_id,
+            codec_name=VIDEO_FOURCC_CODEC_NAMES[sd.fourcc],
+            extradata=sd.extradata,
+            time_base_num=1,
+            time_base_den=video_track.timescale,
+            frame_count=len(video_track.dts_ticks),
+            keyframe_count=(
+                int(video_track.is_keyframe.sum())
+                if video_track.is_keyframe is not None
+                else len(video_track.dts_ticks)
+            ),
+            width=sd.width,
+            height=sd.height,
+            avc_profile_idc=sd.avc_profile_idc,
+            avc_constraint_flags=sd.avc_constraint_flags,
+            avc_level_idc=sd.avc_level_idc,
+            nal_length_size=sd.nal_length_size,
+            chroma_format_idc=sd.chroma_format_idc,
+            bit_depth_luma_minus8=sd.bit_depth_luma_minus8,
+            bit_depth_chroma_minus8=sd.bit_depth_chroma_minus8,
+            buffer_size_db=sd.buffer_size_db,
+            max_bitrate_bps=sd.max_bitrate_bps,
+            avg_bitrate_bps=sd.avg_bitrate_bps,
+            movie_creation_time=video_track.movie_header.creation_time,
+            movie_modification_time=video_track.movie_header.modification_time,
+            track_creation_time=video_track.track_header.creation_time,
+            track_modification_time=video_track.track_header.modification_time,
+            # mypy's attrs plugin mis-infers converter=tuple's own parameter type; already tuple[int, ...] at runtime.
+            track_matrix=video_track.track_header.matrix,  # type: ignore[arg-type]
+            track_display_width=video_track.track_header.width,
+            track_display_height=video_track.track_header.height,
+            elst_bytes=video_track.elst_bytes,
+            ftyp_bytes=ftyp_bytes,
+            avg_frame_rate_num=avg_frame_rate.numerator,
+            avg_frame_rate_den=avg_frame_rate.denominator,
+            bit_rate_bps=bit_rate_bps,
+            duration_ns=duration_ns,
+            encoder_tag=None,
+        )
+
+    @classmethod
+    def from_video_probe(
+        cls,
+        probe: VideoProbe,
+        *,
+        track_id: int,
+        encoder_tag: str | None,
+        elst_bytes: bytes | None,
+        ftyp_bytes: bytes | None,
+    ) -> Self:
+        """Build from libav's reading of one stream; fields libav does not report are ``None``.
+
+        The duration spans the decode times plus the last packet's duration, both as libav
+        reports them, so a final sample stored with no duration takes libav's estimate.
+        """
+        time_base_num, time_base_den = probe.time_base.numerator, probe.time_base.denominator
+        last_duration = int(probe.duration[-1]) if probe.duration is not None and len(probe) else 0
+        duration_ticks = int(probe.dts[-1] - probe.dts[0]) + last_duration if len(probe) else 0
+        avg_frame_rate, bit_rate_bps = _stream_rate_stats(
+            len(probe), probe.size, duration_ticks * time_base_num, time_base_den
+        )
+        return cls(
+            track_id=track_id,
+            codec_name=probe.codec_name,
+            extradata=probe.extradata,
+            time_base_num=time_base_num,
+            time_base_den=time_base_den,
+            frame_count=len(probe),
+            keyframe_count=probe.keyframe_count,
+            width=probe.width,
+            height=probe.height,
+            avc_profile_idc=None,
+            avc_constraint_flags=None,
+            avc_level_idc=None,
+            nal_length_size=None,
+            chroma_format_idc=None,
+            bit_depth_luma_minus8=None,
+            bit_depth_chroma_minus8=None,
+            buffer_size_db=None,
+            max_bitrate_bps=None,
+            avg_bitrate_bps=None,
+            movie_creation_time=None,
+            movie_modification_time=None,
+            track_creation_time=None,
+            track_modification_time=None,
+            track_matrix=None,
+            track_display_width=None,
+            track_display_height=None,
+            elst_bytes=elst_bytes,
+            ftyp_bytes=ftyp_bytes,
+            avg_frame_rate_num=avg_frame_rate.numerator,
+            avg_frame_rate_den=avg_frame_rate.denominator,
+            bit_rate_bps=bit_rate_bps,
+            duration_ns=int(_ticks_to_ns(np.array([duration_ticks], dtype=np.int64), time_base_num, time_base_den)[0]),
+            encoder_tag=encoder_tag,
+        )
+
+
+@attrs.define(frozen=True)
+class IndexedVideo:
+    """One video's frame index and metadata, with the source's ``moov`` box, header included, that they describe."""
+
+    frame_index: Mp4FrameIndex
+    metadata: Mp4Metadata
+    moov_bytes: bytes

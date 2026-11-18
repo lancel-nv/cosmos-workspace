@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_python//python:defs.bzl", "py_library")
+
+# Vendored, custom-built opencv-python-headless (compiled WITH_FFMPEG=OFF and WITH_IPP=OFF; see
+# third_party/opencv/build_wheel.sh). Use in place of the PyPI `opencv-python-headless` pip dependency so cv2 ships no
+# bundled FFmpeg and no statically linked Intel IPP. cv2 keeps every image op (imread/imwrite/imencode/cvtColor/resize/
+# morphology/...); only the VideoCapture/VideoWriter FFmpeg backend is gone (callers route video I/O through the
+# vendored ffmpeg binary instead).
+#
+# This BUILD file is overlaid into the @opencv_python_headless repo created by the `local_wheel` module extension,
+# which extracts the committed wheel zip into the repo root (so `cv2/` and `opencv_python_headless.libs/` sit at the
+# root). `imports = ["."]` puts that root on sys.path; the relative layout of the two dirs is preserved in runfiles so
+# the cv2 extension's `RUNPATH $ORIGIN/../opencv_python_headless.libs` resolves at runtime.
+# The wheel's own .dist-info — METADATA, the OpenCV license, and the bundled-dependency license text in
+# LICENSE-3RD-PARTY.txt. It reaches a runfiles tree, and therefore an image layer and an SBOM, only if a target carries
+# it as data; without it cv2 is invisible to attribution tooling even though the wheel ships complete metadata.
+filegroup(
+    name = "dist_info",
+    srcs = glob(["opencv_python_headless-*.dist-info/**"]),
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "opencv_python_headless",
+    srcs = glob(["cv2/**/*.py"]),
+    # The cv2 extension is mandatory (its absence means a broken wheel), so keep it in a non-empty glob. The rest are
+    # auxiliary: type stubs, the haarcascade data xml, license texts, and — for builds where auditwheel vendors
+    # external shared libs — the opencv_python_headless.libs/ dir (absent here since the extension is statically
+    # linked, hence allow_empty).
+    data = [":dist_info"] + glob(["cv2/**/*.so*"]) + glob(
+        [
+            "cv2/**/*.pyi",
+            "cv2/**/*.xml",
+            "cv2/**/*.txt",
+            "cv2/py.typed",
+            "opencv_python_headless.libs/**",
+        ],
+        allow_empty = True,
+    ),
+    imports = ["."],
+    # Linux x86_64-only vendored wheel (matches the linux-amd64-only ffmpeg tarball and GPU checkers). Gate on both OS
+    # and CPU so linux/arm64 does not incorrectly select this x86_64-only wheel; cv2-using targets cleanly skip on
+    # macOS and on non-x86_64 Linux.
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["@pypi//numpy"],
+)

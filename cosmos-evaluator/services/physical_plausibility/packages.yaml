@@ -1,0 +1,23 @@
+# Security updates over the packages inherited from the CUDA base image.
+# Keep this snapshot aligned with the other apt manifests in this module.
+# Regenerate the lockfile after changing the manifest:
+#   dazel run @physical_plausibility_packages//:lock
+version: 1
+
+sources:
+  - channel: jammy main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+  - channel: jammy-updates main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+  - channel: jammy-security main universe
+    url: https://snapshot.ubuntu.com/ubuntu/20261006T180000Z
+
+archs:
+  - "amd64"
+
+packages:
+  - "gnupg2"  # Override base image version (2.2.27-3ubuntu2.1) with jammy-security patch (2.2.27-3ubuntu2.5)
+  # The CUDA base image freezes apt packages at CUDA release time and ships libssl3 3.0.2-0ubuntu1.18 / openssl
+  # 3.0.2-0ubuntu1.19; no CUDA 12.x tag ships the USN-8414-1 patch, so override both here (3.0.2-0ubuntu1.30).
+  - "libssl3"
+  - "openssl"

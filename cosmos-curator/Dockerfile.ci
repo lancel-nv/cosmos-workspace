@@ -1,0 +1,58 @@
+FROM ghcr.io/prefix-dev/pixi:latest
+
+USER root
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV KUBECTL_VERSION=v1.34.2
+ENV PATH=/opt/cosmos-curator/.pixi/envs/dev/bin:/usr/local/bin:${PATH}
+ENV PIP_NO_CACHE_DIR=1
+ENV PYTHONNOUSERSITE=1
+
+LABEL ci-keep="true"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gettext-base \
+    git \
+    jq \
+    skopeo \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ARCH="$(uname -m)" \
+    && if [ "${ARCH}" = "x86_64" ]; then KUBECTL_ARCH="amd64"; \
+       elif [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "arm64" ]; then KUBECTL_ARCH="arm64"; \
+       else echo "Unsupported architecture: ${ARCH}" && exit 1; fi \
+    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${KUBECTL_ARCH}/kubectl" -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl
+
+RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+ARG VAULT_AGENT_DOWNLOAD_PATH
+RUN test -n "${VAULT_AGENT_DOWNLOAD_PATH}" || { echo "VAULT_AGENT_DOWNLOAD_PATH build arg is required" && exit 1; } \
+    && ARCH="$(uname -m)" \
+    && if [ "${ARCH}" = "x86_64" ]; then VAULT_ARCH="amd64"; \
+       elif [ "${ARCH}" = "aarch64" ] || [ "${ARCH}" = "arm64" ]; then VAULT_ARCH="arm64"; \
+       else echo "Unsupported architecture: ${ARCH}" && exit 1; fi \
+    && VAULT_AGENT_URL="${VAULT_AGENT_DOWNLOAD_PATH}/latest/nvault_agent_linux_${VAULT_ARCH}.zip" \
+    && curl -fsSL "${VAULT_AGENT_URL}" -o /tmp/vault_agent.zip \
+    && cd /tmp \
+    && unzip -o vault_agent.zip \
+    && install -m 0755 vault /usr/local/bin/vault \
+    && rm -f /tmp/vault_agent.zip /tmp/vault
+
+RUN mkdir -p /opt/cosmos-curator \
+    && chown -R ubuntu:ubuntu /opt/cosmos-curator
+
+USER ubuntu
+
+WORKDIR /opt/cosmos-curator
+
+COPY --chown=ubuntu:ubuntu pixi.toml pixi.lock pyproject.toml setup.py MANIFEST.in README.md LICENSE ./
+COPY --chown=ubuntu:ubuntu cosmos_curator ./cosmos_curator
+
+RUN CONDA_OVERRIDE_CUDA=13.0.3 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR=0.0.0 pixi install --frozen -e dev \
+    && rm -rf /home/ubuntu/.cache/pip /home/ubuntu/.cache/pixi /home/ubuntu/.cache/rattler

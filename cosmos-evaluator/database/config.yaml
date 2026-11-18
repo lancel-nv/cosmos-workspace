@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Cosmos Evaluator Database Configuration
+#
+# Local section for the developer-machine PostgreSQL container (cosmos-eval-local-db), auto-launched via DAZEL_RUN_DEPS
+# in .dazelrc. The credentials are supplied via the env vars named below, resolved from the host env or
+# ~/.cosmos_evaluator/.env (the same values that seed the container's POSTGRES_USER / POSTGRES_PASSWORD).
+local:
+  host: localhost
+  port: 5432
+  database: local
+  user_env_var: COSMOS_EVALUATOR_LOCAL_DB_USER
+  password_env_var: COSMOS_EVALUATOR_LOCAL_DB_PASSWORD
+
+  # Connection timeout (seconds), consumed by the asyncpg pool in services/database/service.py.
+  connect_timeout: 10

@@ -1,0 +1,58 @@
+Make `Rope2D.update_grid` publish its `grid_size` guard only after the `freq` tensor that guard protects exists.
+
+Upstream assigns `self.grid_size = (grid_h, grid_w)` as the *first* statement inside the guarded block and
+`self.freq` as the last, so between those two statements the object advertises a cached grid it does not yet have.
+Anything that raises in between — a meta-tensor `RotaryEmbedding` that HF's loader left unmaterialised ("Cannot copy
+out of meta tensor"), a CUDA OOM on the `self.rope.to(device)` move, a sticky CUDA error from an earlier op — leaves
+`grid_size` published against a `freq` that is either `None` or the previous resolution's tensor.
+
+To be clear about the scope: the job whose build raises fails either way, and this does not rescue it. What the
+reorder changes is that the damage stops there. The objects single-view service loads the CWIP model once at startup
+and injects that same instance into every job, so today the inconsistency outlives the failed job — every later job at
+that grid short-circuits the rebuild and dereferences the stale value, failing with
+`AttributeError: 'NoneType' object has no attribute 'to'` (nothing cached yet) or a broadcast-shape mismatch deep
+inside `apply_rotary_emb` (a different resolution cached), neither of which names the real fault, since that sits in an
+earlier job's log. A transient fault such as a CUDA OOM therefore becomes survivable rather than permanent, while a
+deterministic one such as the meta-tensor case still fails every job and gains only an honest error message.
+
+The window is narrow, and worth stating so nobody reads more into this than it does: the allocations between the two
+assignments are small (two `arange`s, an `expand`, and a `cat` of `grid_h * grid_w * dim`), so memory pressure during a
+CWIP forward lands outside the window far more often than inside it, and the CWIP forward itself runs once per clip
+outside any per-frame `except`, so a raise here fails the job loudly instead of silently degrading results.
+
+Swapping the two assignments makes the guard fail-safe: if the build raises, `grid_size` and `freq` both keep their
+previous, mutually consistent values and the next call retries the build. Reordering rather than merely null-checking
+is what closes the one case that fails silently: when the stale and requested grids happen to share a token count (a
+transposed grid, say 16x64 against 64x16) the stale `freq` broadcasts cleanly and the wrong positional encoding
+applies with no error at all. Unreachable at current AV aspect ratios, but cheap to make impossible by construction
+instead of relying on a shape mismatch to catch it. The added `or self.freq is None` disjunct
+covers the case where `freq` is cleared or never built while `grid_size` reads as current — including
+`parallel_patchformer`'s context-parallel path, which swaps `rope.freq` for a sequence-sliced view under a `grid_size`
+that still describes the full grid.
+
+This also removes the torn window that `CWIPPreTrainedModel.inference_lock` exists to hide (see
+`checks/utils/models/cwip/modules/hf_integration.py`): with the reorder, a second thread arriving at the
+same resolution either sees the fully-built pair or redoes the build, instead of reading a half-published one. The
+lock still guards the encoders' other mutable per-pass state, so it stays.
+
+--- a/third_party/perception_models/core/vision_encoder/rope.py
++++ b/third_party/perception_models/core/vision_encoder/rope.py
+@@ -313,9 +313,7 @@ class Rope2D:
+         self.rope = RotaryEmbedding(self.dim // 2)
+ 
+     def update_grid(self, device, grid_h, grid_w):
+-        if self.grid_size != (grid_h, grid_w):
+-            self.grid_size = (grid_h, grid_w)
+-
++        if self.grid_size != (grid_h, grid_w) or self.freq is None:
+             self.rope = self.rope.to(device)
+ 
+             if self.use_cls_token:
+@@ -336,6 +334,7 @@ class Rope2D:
+                 )
+ 
+             self.freq = freq[None, ...]
++            self.grid_size = (grid_h, grid_w)
+ 
+         self.freq = self.freq.to(device)
+ 

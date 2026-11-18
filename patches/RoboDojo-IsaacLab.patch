@@ -1,0 +1,30 @@
+diff --git a/source/isaaclab/isaaclab/assets/deformable_object/deformable_object_data.py b/source/isaaclab/isaaclab/assets/deformable_object/deformable_object_data.py
+index bb7714383..58b054d10 100644
+--- a/source/isaaclab/isaaclab/assets/deformable_object/deformable_object_data.py
++++ b/source/isaaclab/isaaclab/assets/deformable_object/deformable_object_data.py
+@@ -3,6 +3,8 @@
+ #
+ # SPDX-License-Identifier: BSD-3-Clause
+ 
++from __future__ import annotations
++
+ import weakref
+ 
+ import torch
+diff --git a/source/isaaclab/isaaclab/sim/utils/prims.py b/source/isaaclab/isaaclab/sim/utils/prims.py
+index 6fb7850a5..a219bf43f 100644
+--- a/source/isaaclab/isaaclab/sim/utils/prims.py
++++ b/source/isaaclab/isaaclab/sim/utils/prims.py
+@@ -868,8 +868,10 @@ def bind_physics_material(
+     # check if prim has collision applied on it
+     has_physics_scene_api = prim.HasAPI(PhysxSchema.PhysxSceneAPI)
+     has_collider = prim.HasAPI(UsdPhysics.CollisionAPI)
+-    has_deformable_body = prim.HasAPI(PhysxSchema.PhysxDeformableBodyAPI)
+-    has_particle_system = prim.IsA(PhysxSchema.PhysxParticleSystem)
++    deformable_api = getattr(PhysxSchema, "PhysxDeformableBodyAPI", None)
++    particle_schema = getattr(PhysxSchema, "PhysxParticleSystem", None)
++    has_deformable_body = deformable_api is not None and prim.HasAPI(deformable_api)
++    has_particle_system = particle_schema is not None and prim.IsA(particle_schema)
+     if not (has_physics_scene_api or has_collider or has_deformable_body or has_particle_system):
+         logger.debug(
+             f"Cannot apply physics material '{material_path}' on prim '{prim_path}'. It is neither a"

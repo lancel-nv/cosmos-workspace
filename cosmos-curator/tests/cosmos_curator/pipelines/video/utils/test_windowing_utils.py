@@ -1,0 +1,341 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for windowing_utils source-timeline mapping helpers."""
+
+from uuid import uuid4
+
+import numpy as np
+import pytest
+import torch
+
+from cosmos_curator.pipelines.video.utils import windowing_utils
+from cosmos_curator.pipelines.video.utils.data_model import Clip, Window, WindowConfig
+from cosmos_curator.pipelines.video.utils.windowing_utils import (
+    WindowFrameInfo,
+    estimate_native_frame_count,
+    extract_window_mp4_from_clip_relative_ns_bounds,
+    frame_index_to_source_time_s,
+    window_frame_info_from_clip_relative_ns_bounds,
+    window_source_time_bounds_from_clip,
+    window_source_time_bounds_s,
+    window_source_time_trace_attributes,
+)
+
+
+def _make_clip(
+    span: tuple[float, float] = (10.0, 20.0),
+    windows: list[Window] | None = None,
+) -> Clip:
+    """Build a minimal ``Clip`` with optional pre-attached windows."""
+    clip = Clip(uuid=uuid4(), source_video="s3://bucket/video.mp4", span=span)
+    if windows:
+        clip.windows.extend(windows)
+    return clip
+
+
+def test_make_windows_for_clip_threads_video_max_pixels_per_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """WindowConfig carries the fixed resize upper bound into split_video_into_windows()."""
+    captured: dict[str, object] = {}
+
+    def fake_split_video_into_windows(
+        _data: object,
+        **kwargs: object,
+    ) -> tuple[list[bytes | None], list[torch.Tensor | None], list[WindowFrameInfo]]:
+        captured.update(kwargs)
+        return [None], [torch.zeros((1, 3, 2, 2))], [WindowFrameInfo(start=0, end=0)]
+
+    monkeypatch.setattr(windowing_utils, "split_video_into_windows", fake_split_video_into_windows)
+    clip = Clip(
+        uuid=uuid4(),
+        source_video="video.mp4",
+        span=(0.0, 1.0),
+        encoded_data=np.array([1], dtype=np.uint8),
+    )
+    config = WindowConfig(video_max_pixels_per_frame=100500)
+
+    windows, frames = windowing_utils._make_windows_for_clip(
+        clip,
+        config,
+        target_bit_rate="10M",
+        num_decode_threads=1,
+    )
+
+    assert captured["max_pixels_per_frame"] == 100500
+    assert len(windows) == 1
+    assert len(frames) == 1
+
+
+# ---------------------------------------------------------------------------
+# window_frame_info_from_clip_relative_ns_bounds
+# ---------------------------------------------------------------------------
+
+
+class TestWindowFrameInfoFromClipRelativeNsBounds:
+    """``window_frame_info_from_clip_relative_ns_bounds`` inverts metadata ns bounds."""
+
+    def test_exact_bounds_select_nonstandard_window(self) -> None:
+        """A 1..3 frame range is recovered directly from clip-relative PTS."""
+        pts_ns = np.array(
+            [
+                10_000_000_000,
+                10_500_000_000,
+                11_000_000_000,
+                11_500_000_000,
+                12_000_000_000,
+            ],
+            dtype=np.int64,
+        )
+
+        window = window_frame_info_from_clip_relative_ns_bounds(
+            pts_ns,
+            start_ns=500_000_000,
+            end_ns=1_500_000_000,
+        )
+
+        assert window == WindowFrameInfo(start=1, end=3)
+
+    def test_tolerates_one_nanosecond_rounding_difference(self) -> None:
+        """Persisted integer bounds can differ by 1ns after float timestamp conversion."""
+        pts_ns = np.array([0, 500_000_000, 1_000_000_000], dtype=np.int64)
+
+        window = window_frame_info_from_clip_relative_ns_bounds(
+            pts_ns,
+            start_ns=500_000_001,
+            end_ns=999_999_999,
+        )
+
+        assert window == WindowFrameInfo(start=1, end=2)
+
+    def test_raises_when_no_frame_falls_inside_bounds(self) -> None:
+        """Bounds outside the decoded PTS range are explicit extraction failures."""
+        pts_ns = np.array([0, 500_000_000], dtype=np.int64)
+
+        with pytest.raises(ValueError, match="No decoded frames"):
+            window_frame_info_from_clip_relative_ns_bounds(
+                pts_ns,
+                start_ns=1_000_000_000,
+                end_ns=1_500_000_000,
+            )
+
+
+class TestExtractWindowMp4FromClipRelativeNsBounds:
+    """``extract_window_mp4_from_clip_relative_ns_bounds`` selects frames by ns bounds."""
+
+    def test_extracts_frame_range_without_recomputing_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The extracted frame range comes directly from decoded PTS."""
+        captured: dict[str, object] = {}
+
+        def fake_extract(
+            _mp4_bytes: bytes,
+            window: WindowFrameInfo,
+            *,
+            target_bit_rate: str,
+            num_threads: int,
+        ) -> bytes:
+            captured["window"] = window
+            captured["target_bit_rate"] = target_bit_rate
+            captured["num_threads"] = num_threads
+            return b"window"
+
+        monkeypatch.setattr(
+            windowing_utils,
+            "get_video_timestamps",
+            lambda _clip_bytes: np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+        )
+        monkeypatch.setattr(windowing_utils, "_extract_mp4_frame_window_from_bytes", fake_extract)
+
+        result = extract_window_mp4_from_clip_relative_ns_bounds(
+            b"clip",
+            start_ns=500_000_000,
+            end_ns=1_000_000_000,
+            target_bit_rate="9M",
+            num_threads=2,
+        )
+
+        assert result == b"window"
+        assert captured == {
+            "window": WindowFrameInfo(start=1, end=2),
+            "target_bit_rate": "9M",
+            "num_threads": 2,
+        }
+
+
+# ---------------------------------------------------------------------------
+# estimate_native_frame_count
+# ---------------------------------------------------------------------------
+
+
+class TestEstimateNativeFrameCount:
+    """``estimate_native_frame_count`` picks the best N from available data."""
+
+    def test_two_partitioned_windows(self) -> None:
+        """Contiguous partition 0..9, 10..19 yields N=20."""
+        w0 = Window(start_frame=0, end_frame=9)
+        w1 = Window(start_frame=10, end_frame=19)
+        clip = _make_clip(windows=[w0, w1])
+        assert estimate_native_frame_count(clip) == 20
+
+    def test_single_window(self) -> None:
+        """One window 0..127 yields N=128."""
+        w = Window(start_frame=0, end_frame=127)
+        clip = _make_clip(windows=[w])
+        assert estimate_native_frame_count(clip) == 128
+
+    def test_empty_windows_with_fallback(self) -> None:
+        """No clip.windows — falls back to fallback_window.end_frame + 1."""
+        clip = _make_clip()
+        w = Window(start_frame=0, end_frame=4)
+        assert estimate_native_frame_count(clip, fallback_window=w) == 5
+
+    def test_empty_windows_no_fallback_returns_one(self) -> None:
+        """No clip.windows and no fallback — degenerate case returns 1."""
+        clip = _make_clip()
+        assert estimate_native_frame_count(clip) == 1
+
+    def test_fallback_ignored_when_clip_has_windows(self) -> None:
+        """Fallback window is not used when clip.windows is populated."""
+        w0 = Window(start_frame=0, end_frame=9)
+        clip = _make_clip(windows=[w0])
+        fallback = Window(start_frame=0, end_frame=99)
+        assert estimate_native_frame_count(clip, fallback_window=fallback) == 10
+
+
+# ---------------------------------------------------------------------------
+# frame_index_to_source_time_s
+# ---------------------------------------------------------------------------
+
+
+class TestFrameIndexToSourceTimeS:
+    """``frame_index_to_source_time_s`` maps one frame to a source second."""
+
+    def test_first_frame(self) -> None:
+        """Frame 0 maps to clip start."""
+        assert frame_index_to_source_time_s((10.0, 20.0), 0, 20) == 10.0
+
+    def test_last_frame(self) -> None:
+        """Frame N-1 maps to clip end."""
+        assert frame_index_to_source_time_s((10.0, 20.0), 19, 20) == 20.0
+
+    def test_midpoint(self) -> None:
+        """Middle frame of 21 frames maps to exact midpoint of 10s span."""
+        result = frame_index_to_source_time_s((0.0, 10.0), 10, 21)
+        assert result == pytest.approx(5.0)
+
+    def test_single_frame_denominator(self) -> None:
+        """N=1 clamps denominator to 1; result equals t0."""
+        assert frame_index_to_source_time_s((5.0, 15.0), 0, 1) == 5.0
+
+    def test_zero_length_span(self) -> None:
+        """Degenerate span always returns t0 regardless of index."""
+        assert frame_index_to_source_time_s((7.0, 7.0), 5, 10) == 7.0
+
+
+# ---------------------------------------------------------------------------
+# window_source_time_bounds_s
+# ---------------------------------------------------------------------------
+
+
+class TestWindowSourceTimeBoundsS:
+    """``window_source_time_bounds_s`` linearly maps start/end frames."""
+
+    def test_first_window_of_twenty_frames(self) -> None:
+        """Window 0..9 on span (10, 20) with N=20."""
+        t0, t1 = window_source_time_bounds_s((10.0, 20.0), 0, 9, 20)
+        assert t0 == 10.0
+        assert t1 == pytest.approx(10.0 + (9 / 19) * 10.0)
+
+    def test_second_window_of_twenty_frames(self) -> None:
+        """Window 10..19 on span (10, 20) with N=20 ends at clip end."""
+        t0, t1 = window_source_time_bounds_s((10.0, 20.0), 10, 19, 20)
+        assert t0 == pytest.approx(10.0 + (10 / 19) * 10.0)
+        assert t1 == pytest.approx(20.0)
+
+    def test_single_native_frame(self) -> None:
+        """N=1 maps both bounds to clip start."""
+        t0, t1 = window_source_time_bounds_s((5.0, 15.0), 0, 0, 1)
+        assert t0 == 5.0
+        assert t1 == 5.0
+
+    def test_zero_length_clip_span(self) -> None:
+        """Degenerate span yields constant times."""
+        t0, t1 = window_source_time_bounds_s((3.0, 3.0), 0, 5, 10)
+        assert t0 == 3.0
+        assert t1 == 3.0
+
+    def test_full_range_window_covers_entire_span(self) -> None:
+        """A single window covering 0..(N-1) maps exactly to clip start/end."""
+        t0, t1 = window_source_time_bounds_s((0.0, 60.0), 0, 99, 100)
+        assert t0 == pytest.approx(0.0)
+        assert t1 == pytest.approx(60.0)
+
+
+class TestWindowSourceTimeBoundsFromClip:
+    """``window_source_time_bounds_from_clip`` combines N estimation with mapping."""
+
+    def test_end_to_end_with_two_windows(self) -> None:
+        """First window of a 10s clip (span 10..20, 20 native frames)."""
+        w0 = Window(start_frame=0, end_frame=9)
+        w1 = Window(start_frame=10, end_frame=19)
+        clip = _make_clip(span=(10.0, 20.0), windows=[w0, w1])
+
+        t0, t1 = window_source_time_bounds_from_clip(clip, w0)
+        assert t0 == 10.0
+        assert t1 == pytest.approx(10.0 + (9 / 19) * 10.0)
+
+        t0_b, t1_b = window_source_time_bounds_from_clip(clip, w1)
+        assert t1_b == pytest.approx(20.0)
+        # Second window starts where first ended (continuous timeline).
+        assert t0_b == pytest.approx(10.0 + (10 / 19) * 10.0)
+
+    def test_fallback_when_clip_windows_empty(self) -> None:
+        """Uses the passed window for N estimation when clip.windows is empty."""
+        w = Window(start_frame=0, end_frame=4)
+        clip = _make_clip(span=(0.0, 5.0))
+
+        t0, t1 = window_source_time_bounds_from_clip(clip, w)
+        assert t0 == 0.0
+        assert t1 == pytest.approx(5.0)
+
+
+class TestWindowSourceTimeTraceAttributes:
+    """``window_source_time_trace_attributes`` returns OTel-safe dict."""
+
+    def test_returns_all_expected_keys(self) -> None:
+        """Dict contains source times, clip span, and human-readable bounds."""
+        w0 = Window(start_frame=0, end_frame=9)
+        w1 = Window(start_frame=10, end_frame=19)
+        clip = _make_clip(span=(10.0, 20.0), windows=[w0, w1])
+
+        attrs = window_source_time_trace_attributes(clip, w0)
+
+        assert set(attrs.keys()) == {
+            "window.source_start_s",
+            "window.source_end_s",
+            "window.clip_span_start_s",
+            "window.clip_span_end_s",
+            "window.source_bounds",
+        }
+        assert attrs["window.source_start_s"] == 10.0
+        assert attrs["window.source_end_s"] == pytest.approx(10.0 + (9 / 19) * 10.0)
+        assert attrs["window.clip_span_start_s"] == 10.0
+        assert attrs["window.clip_span_end_s"] == 20.0
+        assert isinstance(attrs["window.source_bounds"], str)
+
+    def test_returns_empty_dict_on_bad_clip(self) -> None:
+        """Malformed clip data does not raise -- returns empty dict."""
+        clip = _make_clip(span=(10.0, 20.0))
+        bad_window = Window(start_frame=0, end_frame=-1)
+        result = window_source_time_trace_attributes(clip, bad_window)
+        assert isinstance(result, dict)

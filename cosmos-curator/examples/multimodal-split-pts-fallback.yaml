@@ -1,0 +1,30 @@
+schema_version: 1
+kind: multimodal-split
+input:
+  mp4_index_uri: s3://bucket_name/golden_v52_v1/test/mp4-index/manifest.lance
+  input_path_prefix: s3://bucket_name/golden_v52_v1/test/clips
+sensors:
+  front:
+    sensor_type: camera
+    uri_pattern: '*/camera_front.mp4'
+    required: true
+    # Use the first available complete column; container PTS must be explicit.
+    camera_alignment_fields: [eof_ns, edited_pts_ns]
+output:
+  path: s3://bucket_name/golden_v52_v1/test/multimodal-split-output
+clip:
+  duration_s: 10.0
+  sampling_fps: 30
+video:
+  max_delta_s: 0.05
+  encoder:
+    video_encoder: libopenh264
+    video_bitrate: 4M
+    gop_size: 30
+    faststart: true
+execution:
+  progress: false
+  storage_profile: default
+  span_planner:
+    num_cpus: 0.125
+  split_session: {}

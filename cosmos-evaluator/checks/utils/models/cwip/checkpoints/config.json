@@ -1,0 +1,70 @@
+{
+  "model_type": "cwip",
+  "camera_encoder": {
+    "encoder_type": "pe",
+    "encoder_cfg_name": "PE-Spatial-B16-512",
+    "num_alignment_layers": 2,
+    "output_dim": 1024,
+    "use_tensor_parallel": false
+  },
+  "world_encoder": {
+    "encoder_type": "pe",
+    "encoder_cfg_name": "PE-Spatial-B16-512",
+    "num_alignment_layers": 5,
+    "output_dim": 1024,
+    "use_tensor_parallel": false
+  },
+  "patch_classifier": {
+    "type": "ParallelPatchFormer",
+    "camera_dim": 768,
+    "world_dim": 768,
+    "num_classes": null,
+    "hidden_dim": 768,
+    "num_layers": 2,
+    "num_heads": 12,
+    "mlp_ratio": 4.0,
+    "cross_attn_frequency": 1,
+    "ls_init_value": null,
+    "drop_path": 0.0,
+    "use_abs_posemb": false,
+    "use_rope2d": true,
+    "input_resize_factor": 4,
+    "treat_wrong_type_as_match": false,
+    "use_legacy_transformer": false,
+    "per_class_temperature_similarity": null,
+    "per_class_bias_similarity": null,
+    "per_class_temperature_type": null,
+    "per_class_bias_type": null,
+    "excluded_model_classes_for_argmax_similarity": null,
+    "excluded_model_classes_for_argmax_type": null,
+    "use_tensor_parallel": false,
+    "use_deformable_attn": true,
+    "use_deformable_attn_type": true,
+    "patch_classification_type": [
+      "patch_type",
+      "patch_similarity"
+    ],
+    "use_separate_necks": true,
+    "neck_type_config": {
+      "num_layers": 4
+    },
+    "neck_similarity_config": null,
+    "fused_kv_camera_world_cross_attn": false,
+    "use_separate_projs": true,
+    "pre_upscale_when_deformable_off": false,
+    "use_sr_attn": false,
+    "sr_ratio": 8,
+    "deformable_num_sampling_points": 4,
+    "deformable_query_upsample_method": "bilinear",
+    "deformable_query_upsample_kernel_size": 3
+  },
+  "precision": "torch.bfloat16",
+  "true_context_parallel_size": 1,
+  "inference": {
+    "mode": true,
+    "output_dir": null,
+    "chunk_threshold": 128,
+    "patch_classifier_activation": "sigmoid"
+  },
+  "object_type_class_mapping": "v4"
+}

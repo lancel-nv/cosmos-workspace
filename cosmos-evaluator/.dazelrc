@@ -1,0 +1,391 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dazel configuration for Cosmos Evaluator. See https://github.com/nadirizr/dazel for full schema.
+
+from datetime import datetime
+import getpass
+import os
+import re
+import subprocess
+import sys
+
+
+# Walk up from CWD looking for MODULE.bazel; that's the Bazel workspace root.
+def _find_workspace_root(_start: str) -> str:
+    _d = os.path.realpath(_start)
+    while _d and _d != os.path.dirname(_d) and not os.path.exists(os.path.join(_d, "MODULE.bazel")):
+        _d = os.path.dirname(_d)
+    if not os.path.exists(os.path.join(_d, "MODULE.bazel")):
+        raise SystemExit(f"Cosmos Evaluator: could not find a workspace root (no MODULE.bazel above {_start!r})")
+    return _d
+
+
+_workspace_root = _find_workspace_root(os.getcwd())
+
+# Git SHA of the current HEAD - captured on the host because it's written into the dazel docker image as a label (see
+# DAZEL_ADDITIONAL_DOCKER_RUN_ARGS below). Guarded so a non-git source tree (e.g. an extracted release tarball) still
+# loads this config instead of aborting: honor an explicit COSMOS_EVAL_GIT_SHA override, otherwise fall back to
+# "unknown" if `git rev-parse` fails or git is unavailable.
+GIT_SHA = os.environ.get("COSMOS_EVAL_GIT_SHA", "")
+if not GIT_SHA:
+    try:
+        GIT_SHA = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode("utf-8").strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        GIT_SHA = "unknown"
+
+DISPLAY = os.environ.get("DISPLAY", ":0")
+GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
+HOME = os.environ.get("HOME", os.path.expanduser("~"))
+USER = os.environ.get("USER", getpass.getuser())
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Project-overridable Parameters
+# ----------------------------------------------------------------------------------------------------------------------
+PROJECT_DAZEL_INSTANCE_NAME = globals().get("PROJECT_DAZEL_INSTANCE_NAME", "cosmos-eval")
+PROJECT_DAZEL_CACHE_NAMESPACE = globals().get("PROJECT_DAZEL_CACHE_NAMESPACE", "cosmos_eval")
+
+# Filesystem path of the Cosmos Evaluator module root: the workspace root when this file is the standalone config, or
+# the consumer-declared embed path via PROJECT_COSMOS_EVAL_ROOT when embedded
+_cosmos_eval_root = globals().get("PROJECT_COSMOS_EVAL_ROOT", _workspace_root)
+
+# Optional suffix appended to the dazel container name and the bazel user-output cache directory. Used to scope
+# concurrent jobs on the same host (each job gets its own container + bazel-output dir while sharing the disk-cache and
+# repository-cache). Defaults to empty (no suffix); consumers can either set it via globals() before exec'ing this file,
+# or by exporting the PROJECT_DAZEL_INSTANCE_SUFFIX env var. The env var name is intentionally generic so any build
+# system can plug its own concurrent-job identifier into it.
+PROJECT_DAZEL_INSTANCE_SUFFIX = globals().get(
+    "PROJECT_DAZEL_INSTANCE_SUFFIX",
+    os.environ.get("PROJECT_DAZEL_INSTANCE_SUFFIX", ""),
+)
+DAZEL_INSTANCE_NAME = (
+    f"{PROJECT_DAZEL_INSTANCE_NAME}-{PROJECT_DAZEL_INSTANCE_SUFFIX}"
+    if PROJECT_DAZEL_INSTANCE_SUFFIX
+    else PROJECT_DAZEL_INSTANCE_NAME
+)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Image / build configuration.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_IMAGE_NAME = "build"  # No tag; the latest tag is pulled by default
+DAZEL_RUN_COMMAND = "/bin/bash"
+DAZEL_DOCKER_COMMAND = "docker"
+# No remote registry: the dazel image is always built locally from DAZEL_DOCKERFILE (which is always present on disk),
+# so dazel's pull path is never taken. Empty keeps the local image name unprefixed.
+DAZEL_REPOSITORY = ""
+DAZEL_DIRECTORY = os.path.join(_cosmos_eval_root, "tools/dazel")
+DAZEL_DOCKERFILE = os.path.join(DAZEL_DIRECTORY, "Dockerfile")
+DAZEL_COMMAND = "bazel"
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Lint + format wiring consumed by dazel.py's `lint` / `fix` dispatch.
+# ----------------------------------------------------------------------------------------------------------------------
+# DAZEL_LINTER_SCRIPT is the shell wrapper invoked by `dazel lint` / `dazel fix`.
+DAZEL_LINTER_SCRIPT = os.path.join(_workspace_root, "tools/lint/linter.sh")
+
+# DAZEL_FORMATTER_TARGET is the Bazel label of the formatter run during `dazel fix`. The format_multirun target uses
+# ruff under the hood, which walks up from each source file to the nearest pyproject.toml for per-file config
+# resolution ( a single target invocation correctly formats files across nested workspaces).
+DAZEL_FORMATTER_TARGET = "//tools/format:format_multirun"
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Volume mounts: bazel caches + generic dev credentials.
+#
+# Cache directory uses PROJECT_DAZEL_CACHE_NAMESPACE so concurrent projects on the same host don't overwrite each
+# other's caches.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_VOLUMES = []
+
+_cache_suffix = f"_{PROJECT_DAZEL_INSTANCE_SUFFIX}" if PROJECT_DAZEL_INSTANCE_SUFFIX else ""
+DAZEL_BAZEL_USER_OUTPUT_ROOT = os.path.join(
+    HOME, f".cache/dazel/{PROJECT_DAZEL_CACHE_NAMESPACE}/_dazel_{USER}{_cache_suffix}"
+)
+os.makedirs(DAZEL_BAZEL_USER_OUTPUT_ROOT, exist_ok=True)
+
+# Mount the whole dazel cache folder to allow `dazel clean --expunge_async`. Mounting only the user-scoped dir leaves
+# the parent owned by root, which blocks the cache-directory move that expunge needs.
+DAZEL_VOLUMES.append(f"{DAZEL_BAZEL_USER_OUTPUT_ROOT}:{DAZEL_BAZEL_USER_OUTPUT_ROOT}")
+
+DAZEL_BAZEL_DISK_CACHE_ROOT = os.path.join(HOME, f".cache/dazel/{PROJECT_DAZEL_CACHE_NAMESPACE}/disk-cache")
+os.makedirs(DAZEL_BAZEL_DISK_CACHE_ROOT, exist_ok=True)
+DAZEL_VOLUMES.append(f"{DAZEL_BAZEL_DISK_CACHE_ROOT}:{DAZEL_BAZEL_DISK_CACHE_ROOT}")
+
+DAZEL_BAZEL_REPO_CACHE_ROOT = os.path.join(HOME, f".cache/dazel/{PROJECT_DAZEL_CACHE_NAMESPACE}/repository-cache")
+os.makedirs(DAZEL_BAZEL_REPO_CACHE_ROOT, exist_ok=True)
+DAZEL_VOLUMES.append(f"{DAZEL_BAZEL_REPO_CACHE_ROOT}:{DAZEL_BAZEL_REPO_CACHE_ROOT}")
+
+# Generic developer credential / config dirs. Each is added only if it exists on the host.
+docker_dir = os.path.join(HOME, ".docker")  # Docker registry auth
+if os.path.exists(docker_dir):
+    DAZEL_VOLUMES.append(f"{docker_dir}:{docker_dir}")
+
+# Pre-create ~/.ssh so the bind mount is always added. This makes keys written into ~/.ssh after container startup
+# visible inside the container live.
+ssh_dir = os.path.join(HOME, ".ssh")
+os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+DAZEL_VOLUMES.append(f"{ssh_dir}:{ssh_dir}")
+
+netrc_path = os.path.join(HOME, ".netrc")
+if os.path.exists(netrc_path):
+    DAZEL_VOLUMES.append(f"{netrc_path}:{netrc_path}")
+
+aws_dir = os.path.join(HOME, ".aws")
+if os.path.exists(aws_dir):
+    DAZEL_VOLUMES.append(f"{aws_dir}:{aws_dir}")
+
+cosmos_evaluator_dir = os.path.join(HOME, ".cosmos_evaluator")
+if os.path.exists(cosmos_evaluator_dir):
+    DAZEL_VOLUMES.append(f"{cosmos_evaluator_dir}:{cosmos_evaluator_dir}")
+
+if os.path.exists("/tmp/.X11-unix"):
+    DAZEL_VOLUMES.append("/tmp/.X11-unix:/tmp/.X11-unix")
+
+if os.path.exists("/var/run/docker.sock"):
+    DAZEL_VOLUMES.append("/var/run/docker.sock:/var/run/docker.sock")
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Ports: empty by default.
+# Note: when DAZEL_NETWORK="host" docker silently ignores -p, so this is a no-op in that mode.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_PORTS = []
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Environment variables forwarded into the container.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_ENV_VARS = [
+    f"DISPLAY={DISPLAY}",
+    f"GITLAB_TOKEN={GITLAB_TOKEN}",
+    "NVIDIA_DRIVER_CAPABILITIES=all",
+    "NVIDIA_VISIBLE_DEVICES=all",
+    "PYTHONDONTWRITEBYTECODE=1",
+]
+
+
+def _merge_env_var(env_list, key, val):
+    """Replace an existing `KEY=...` entry in env_list, or append `KEY=val` if absent."""
+    for i, entry in enumerate(env_list):
+        if entry.split("=", 1)[0] == key:
+            env_list[i] = f"{key}={val}"
+            return
+    env_list.append(f"{key}={val}")
+
+
+def _docker_image_present(_tag):
+    """Return True if a docker image with the given tag is loaded locally. Used to gate the local-DB run-dep so dazel
+    doesn't try to start a sidecar whose image hasn't been bootstrapped yet (see tools/env_setup.sh)."""
+    try:
+        return subprocess.run(
+            ["docker", "image", "inspect", _tag],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    except (FileNotFoundError, OSError):
+        return False
+
+
+# Local app env file (~/.cosmos_evaluator/.env). Parsed once into a dict so it can feed both DAZEL_ENV_VARS (here)
+# and the local-DB run-dep below. Merged into DAZEL_ENV_VARS *before* the host prefix-forward loop so the file acts as
+# a set of defaults: any matching env var present in the host shell (applied by the loop below) overrides it, letting
+# users override an individual value without editing the file.
+_cosmos_evaluator_env_file = os.path.join(cosmos_evaluator_dir, ".env")
+_cosmos_evaluator_env = {}
+if os.path.exists(_cosmos_evaluator_env_file):
+    with open(_cosmos_evaluator_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                _comment_idx = _val.find(" #")
+                if _comment_idx != -1:
+                    _val = _val[:_comment_idx].rstrip()
+                _cosmos_evaluator_env[_key] = _val
+
+# Multistorage config delivery: an inline MULTISTORAGECLIENT_CONFIGURATION JSON blob cannot be forwarded verbatim via
+# `docker -e KEY=VALUE` without its quoting being mangled. Since ~/.cosmos_evaluator/ is bind-mounted into the container
+# at the same absolute path, materialize the JSON to a file there and forward MSC_CONFIG=<path> instead
+# (multistorageclient reads MSC_CONFIG natively). An explicit MSC_CONFIG in the .env always wins.
+_msc_inline = _cosmos_evaluator_env.pop("MULTISTORAGECLIENT_CONFIGURATION", None)
+if _msc_inline is not None and "MSC_CONFIG" not in _cosmos_evaluator_env:
+    _msc_inline = _msc_inline.strip()
+    # Strip one layer of matching surrounding quotes (the .env convention wraps the JSON in single quotes).
+    if len(_msc_inline) >= 2 and _msc_inline[0] == _msc_inline[-1] and _msc_inline[0] in ("'", '"'):
+        _msc_inline = _msc_inline[1:-1]
+    _msc_config_path = os.path.join(cosmos_evaluator_dir, ".msc_config.generated.json")
+    with open(_msc_config_path, "w") as _msc_f:
+        _msc_f.write(_msc_inline)
+    # Same-path bind mount => the container sees this file at the identical path.
+    _cosmos_evaluator_env["MSC_CONFIG"] = _msc_config_path
+
+for _key, _val in _cosmos_evaluator_env.items():
+    _merge_env_var(DAZEL_ENV_VARS, _key, _val)
+
+# Forward host env vars matching known prefixes into the container
+_FORWARD_PREFIXES = (
+    "COSMOS_EVALUATOR_",
+    # The physical plausibility checker resolves its attention bundle from a gated Hugging Face repository during
+    # startup, so HF_TOKEN has to reach the container for its image test (and any local CLI run) to get past auth.
+    "HF_",
+)
+for _key, _val in os.environ.items():
+    if not _key.startswith(_FORWARD_PREFIXES):
+        continue
+    _merge_env_var(DAZEL_ENV_VARS, _key, _val)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# GPU + networking.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_GPUS = "all"  # Triggers the nvidia-container-toolkit runtime
+DAZEL_NETWORK = "host"
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Run dependencies: generic local Postgres sidecar (empty DB, no bundled dump).
+#
+# Auto-launched only when cosmos_eval is the *active* workspace. When this file is exec'd as a baseline from a different
+# workspace root the two paths differ, so cosmos-eval-local-db is not added to that workspace's run-deps. Additionally,
+# gated on credentials being present in the host env or ~/.cosmos_evaluator/.env and on the database-postgres:<VERSION>
+# image already being loaded (bootstrapped by tools/env_setup.sh). The generic image entrypoint (startup.sh) takes
+# POSTGRES_* contract directly; with no BACKUP_FILE it comes up as an empty DB carrying only the base orchestration
+# schema.
+#
+#   To temporarily disable the dep without unsetting credentials:
+#     docker stop cosmos-eval-local-db
+#   To free the named-volume data and start fresh:
+#     docker rm -f cosmos-eval-local-db && docker volume rm cosmos-eval-local-db-data
+#
+# COSMOS_EVAL_NO_LOCAL_DB=1 suppresses this sidecar entirely (same flag that skips the image bootstrap in
+# tools/env_setup.sh). Useful for standalone dazel invocations that never touch the DB - e.g. lint/format passes - so
+# it doesn't spuriously launch (and, on host networking, collide with another local Postgres already bound to port
+# 5432).
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_RUN_DEPS = []
+
+if _workspace_root == _cosmos_eval_root and not os.environ.get("COSMOS_EVAL_NO_LOCAL_DB"):
+    _ce_db_version_bzl = os.path.join(_cosmos_eval_root, "database", "version.bzl")
+    try:
+        with open(_ce_db_version_bzl) as _f:
+            _ce_db_version_match = re.search(r'VERSION\s*=\s*"([^"]+)"', _f.read())
+        _ce_db_version = _ce_db_version_match.group(1) if _ce_db_version_match else None
+    except OSError:
+        _ce_db_version = None
+
+    _ce_db_user = os.environ.get(
+        "COSMOS_EVALUATOR_LOCAL_DB_USER", _cosmos_evaluator_env.get("COSMOS_EVALUATOR_LOCAL_DB_USER", "")
+    )
+    _ce_db_password = os.environ.get(
+        "COSMOS_EVALUATOR_LOCAL_DB_PASSWORD", _cosmos_evaluator_env.get("COSMOS_EVALUATOR_LOCAL_DB_PASSWORD", "")
+    )
+    _ce_db_creds_present = bool(_ce_db_user and _ce_db_password)
+    # The sidecar runs the PostgreSQL image built by //database:image_load, which tags itself
+    # `database-postgres:<VERSION>`.
+    _ce_db_image = f"database-postgres:{_ce_db_version}" if _ce_db_version else None
+    _ce_db_image_loaded = bool(_ce_db_image) and _docker_image_present(_ce_db_image)
+
+    if _ce_db_creds_present and _ce_db_image and not _ce_db_image_loaded:
+        sys.stderr.write(
+            f"\033[33mWARNING: Expected Docker image `{_ce_db_image}` is not loaded; cosmos-eval-local-db "
+            f"autostart skipped. Run `. tools/env_setup.sh` to build and load it.\033[0m\n"
+        )
+
+    if _ce_db_creds_present and _ce_db_image_loaded:
+        DAZEL_RUN_DEPS = [
+            {
+                "image": _ce_db_image,
+                "name": "cosmos-eval-local-db",
+                "env": {
+                    "POSTGRES_USER": _ce_db_user,
+                    "POSTGRES_PASSWORD": _ce_db_password,
+                    "POSTGRES_DB": "local",
+                },
+                "volumes": ["cosmos-eval-local-db-data:/var/lib/postgresql/data"],
+                # Block dazel until postgres is accepting connections to prevent races on container use.
+                "ready_probe": {
+                    "cmd": ["pg_isready", "-q", "-h", "localhost", "-p", "5432"],
+                    "timeout_s": 240,
+                    "interval_s": 1,
+                    "progress_every_s": 5,
+                    "description": "PostgreSQL accepting connections on localhost:5432",
+                },
+            },
+        ]
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Docker compose (unused; left at defaults for completeness).
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_DOCKER_COMPOSE_FILE = ""
+DAZEL_DOCKER_COMPOSE_COMMAND = "docker-compose"
+DAZEL_DOCKER_COMPOSE_PROJECT_NAME = "dazel"
+DAZEL_DOCKER_COMPOSE_SERVICES = ""
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Misc dazel Parameters.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_DOCKER_RUN_PRIVILEGED = False
+DAZEL_BAZEL_RC_FILE = ".bazelrc"
+DAZEL_DELEGATED_VOLUME = False  # macOSX :delegated mount flag; unused on Linux.
+DAZEL_USER = USER
+DAZEL_RUN_FILE = os.path.join(_workspace_root, ".dazel_run")
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Linux groups to add inside the container so file ownership stays consistent across the bind mounts (especially the
+# bazel cache).
+# ----------------------------------------------------------------------------------------------------------------------
+groups = (
+    subprocess.run("id -G | xargs getent group", shell=True, stdout=subprocess.PIPE)
+    .stdout
+    .decode("utf-8")
+    .strip()
+    .split("\n")
+)
+# `xargs getent group` may return empty lines if the user is in a group not present in
+# /etc/group; skip those.
+groups = [g.split(":") for g in groups]
+groups = [g for g in groups if len(g) > 2]
+# Groups containing spaces can't be recreated via `groupadd` inside the Dockerfile; drop them.
+groups = [":".join([g[0], g[2]]) for g in groups if " " not in g[0]]
+groups = " ".join(groups)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Custom FFmpeg 9.0.1 LGPL build (NVENC/CUVID + SVT-AV1). The tarball is consumed by the baseline Dockerfile via
+# `COPY --from=ffmpeg ...`, which requires Docker's `--build-context` flag to point at the directory holding the
+# tarball. See third_party/ffmpeg/tar.sh to rebuild.
+# ----------------------------------------------------------------------------------------------------------------------
+_ffmpeg_dir = os.path.join(_cosmos_eval_root, "third_party/ffmpeg")
+_ffmpeg_tarball = os.path.join(_ffmpeg_dir, "ffmpeg-9.0.1-lgpl-nvenc-svtav1-linux-amd64.tar.gz")
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Image build args.
+# ----------------------------------------------------------------------------------------------------------------------
+_build_args = [
+    f"--build-arg user_id={os.getuid()}",
+    f"--build-arg user_name={USER}",
+    f"--build-arg home={HOME}",
+    f"--build-arg groups='{groups}'",
+    f"--label 'build_date={datetime.now().strftime('%Y-%m-%d')}'",
+    f"--label 'git_commit_sha={GIT_SHA}'",
+    f"--build-context ffmpeg={_ffmpeg_dir}",
+]
+
+DAZEL_DOCKER_BUILD_ARGS = " ".join(_build_args)
+
+# ----------------------------------------------------------------------------------------------------------------------
+# File-watch list: changes to any of these force a dazel image rebuild.
+# ----------------------------------------------------------------------------------------------------------------------
+DAZEL_FILES_WATCH = [
+    DAZEL_DOCKERFILE,
+    _ffmpeg_tarball,
+    os.path.join(_workspace_root, ".dazelrc"),
+    os.path.join(_workspace_root, "user.dazelrc"),
+]

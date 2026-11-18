@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "datasets_root": "../data/runs",
+  "collection_python": ".venv-sim/bin/python",
+  "lerobot_python": ".venv-lerobot/bin/python",
+  "curator_root": "../cosmos-curator",
+  "episodes": 500,
+  "min_successes": 200,
+  "min_failures": 201,
+  "max_episodes": 5000,
+  "start": 840,
+  "seed": 20261114,
+  "priority_layout_indices": [
+    95,
+    35
+  ],
+  "policy_calibration": {
+    "35": {
+      "speed_m_s": 0.17783763382853027,
+      "lateral_bias_m": -0.00017632070208812835,
+      "speed_jitter_m_s": 0.0005,
+      "bias_jitter_m": 2e-05,
+      "source_episode": "push_t_500_feedback_v3_s200/episode_000035",
+      "source_trajectory_sha256": "0adf36f4f46594b5ca99d8dbd4f44ea5aabf295039295bfa8bd321ca56e0f31d"
+    },
+    "95": {
+      "speed_m_s": 0.18352164249817038,
+      "lateral_bias_m": -0.00024171176497357096,
+      "speed_jitter_m_s": 0.0005,
+      "bias_jitter_m": 2e-05,
+      "source_episode": "push_t_500_feedback_v3_s200/episode_000095",
+      "source_trajectory_sha256": "528c3b9347405e0454476eef48da7552fae8c862778158eb962fb4dec91a4701"
+    }
+  },
+  "max_steps": 600,
+  "smoke_episodes": 6,
+  "quality": {
+    "min_object_displacement_m": 0.001,
+    "min_moving_episode_fraction": 0.5,
+    "min_ik_success_rate_per_arm": 0.8
+  },
+  "curator": {
+    "image_name": "cosmos-curator",
+    "image_tag": "local",
+    "video_bitrate": "8M"
+  }
+}

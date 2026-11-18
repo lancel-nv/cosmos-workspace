@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""A Pixi-based runtime environment for Ray."""
+
+import shlex
+import sys
+
+from ray.runtime_env import RuntimeEnv
+
+_RAY_DATA_GPU_ENV_VARS = {
+    # TODO: Remove this once the base image stops setting
+    # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 for Xenna. Ray skips
+    # CUDA_VISIBLE_DEVICES masking when this inverted flag is truthy, so "0"
+    # restores Ray's normal per-actor GPU visibility for Ray Data stages.
+    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
+    # vLLM derives its cache root from XDG_CACHE_HOME, which the
+    # points at the user's cache on a shared cluster filesystem - so every
+    # engine worker on every node would read and write one compile-cache
+    # directory with no cross-node lock. Node-local storage gives each worker
+    # its own tree; the cache then does not outlive the node, which is
+    # accepted because the compile artifacts regenerate on demand.
+    "VLLM_CACHE_ROOT": "/tmp/vllm",  # noqa: S108
+}
+
+
+class PixiRuntimeEnv(RuntimeEnv):
+    """RuntimeEnv that launches Python inside a Pixi environment.
+
+    This thin wrapper forwards all arguments to :class:`ray.runtime_env.RuntimeEnv`
+    but overrides ``py_executable`` to select the Pixi environment and configure a
+    private Transformers module cache before loading Ray's worker entry point.
+    """
+
+    def __init__(self, env_name: str, env_vars: dict[str, str] | None = None) -> None:
+        """Create a Pixi-backed Ray runtime environment.
+
+        Parameters
+        ----------
+        env_name: str
+            Name of the Pixi environment to activate. If empty, the default
+            Python executable resolution is used.
+        env_vars: dict[str, str] | None
+            Environment variables to forward into the Ray runtime environment.
+
+        """
+        copied_env_vars = None if env_vars is None else dict(env_vars)
+        python = f"pixi run --as-is -e {shlex.quote(env_name)} python" if env_name else shlex.quote(sys.executable)
+        super().__init__(
+            env_vars=copied_env_vars,
+            py_executable=f"{python} -m cosmos_curator.core.utils.hf_module_cache",
+        )
+
+
+def ray_data_gpu_runtime_env(env_name: str, env_vars: dict[str, str] | None = None) -> PixiRuntimeEnv:
+    """Create a Pixi runtime env for Ray Data GPU stages, with GPU masking and a node-local vLLM cache."""
+    copied_env_vars = {} if env_vars is None else dict(env_vars)
+    copied_env_vars.update(_RAY_DATA_GPU_ENV_VARS)
+    return PixiRuntimeEnv(env_name, env_vars=copied_env_vars)

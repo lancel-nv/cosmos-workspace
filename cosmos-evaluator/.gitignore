@@ -1,0 +1,13 @@
+# Bazel artifacts
+/bazel-*
+/user.bazelrc
+
+# Dazel artifacts
+/.dazel_run
+/user.dazelrc
+
+# Claude Code notes
+.claude/notes/*
+
+# Environment variable files (often hold secrets)
+.env

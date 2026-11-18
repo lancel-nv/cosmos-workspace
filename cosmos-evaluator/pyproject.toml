@@ -1,0 +1,37 @@
+[tool.mypy]
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+exclude_gitignore = true
+explicit_package_bases = true
+follow_imports = "silent"
+follow_imports_for_stubs = true
+ignore_missing_imports = true
+namespace_packages = true
+plugins = ["pydantic.mypy"]
+python_version = "3.13"
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+explicit-preview-rules = true
+extend-select = [
+    "I", # isort
+    "E501", # https://docs.astral.sh/ruff/rules/line-too-long/#line-too-long-e501
+    "PLC0415", # https://docs.astral.sh/ruff/rules/import-outside-top-level/#import-outside-top-level-plc0415
+    "G001", # https://docs.astral.sh/ruff/rules/logging-string-format/#logging-string-format-g001
+    "G002", # https://docs.astral.sh/ruff/rules/logging-percent-format/#logging-percent-format-g002
+    "G003", # https://docs.astral.sh/ruff/rules/logging-string-concat/#logging-string-concat-g003
+    "G004", # https://docs.astral.sh/ruff/rules/logging-f-string/#logging-f-string-g004
+]
+preview = true
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["checks", "database", "docs", "kpi", "services", "tools", "utils"]
+known-third-party = ["third_party"]

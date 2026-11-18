@@ -1,0 +1,33 @@
+Cosmos Evaluator
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+THIRD-PARTY SOFTWARE DISCLAIMER
+
+This project will download and install additional third-party open source
+software projects. Review the license terms of these open source projects
+before use.
+
+The build obtains the software below from external sources at build time. It
+is not part of this repository, NVIDIA does not redistribute it here, and the
+NOTICE file does not list it. Each project is governed by its own license
+terms, which are published by that project.
+
+  - Python packages installed from the Python Package Index and the PyTorch
+    package index, at the versions pinned in requirements.txt.
+  - Source archives fetched by Bazel as declared in MODULE.bazel: the Cosmos
+    Drive Dreams toolkits (https://github.com/nv-tlabs/Cosmos-Drive-Dreams),
+    Detectron2 (https://github.com/facebookresearch/detectron2), and
+    Perception Models (https://github.com/facebookresearch/perception_models).
+    A copy of each project's license is kept in third_party/<name>/LICENSE.
+  - The Bazel modules, the hermetic CPython interpreter, and the NVIDIA CUDA
+    packages declared in MODULE.bazel.
+  - The container base images declared in MODULE.bazel and
+    tools/dazel/Dockerfile, and the operating-system packages installed into
+    them.
+
+The third-party software and model materials that are committed to this
+repository, directly or through Git LFS, are listed with their copyright
+notices and license texts in NOTICE. Each container image built from this
+repository carries its own THIRD-PARTY-NOTICES.txt for the software it
+contains; the source of that file is in the corresponding service directory
+under services/.

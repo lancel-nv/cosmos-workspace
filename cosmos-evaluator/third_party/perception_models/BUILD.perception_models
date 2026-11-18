@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_python//python:defs.bzl", "py_library")
+
+# The .dist-info synthesized by the `dist_info_*` attrs on this archive's `http_archive.archive(...)` tag (see
+# ../../MODULE.bazel) only reaches a runfiles tree — and therefore an image layer, and therefore an SBOM — if a target
+# carries it as data.
+filegroup(
+    name = "dist_info",
+    srcs = glob(["third_party/perception_models/perception_models-*.dist-info/**"]),
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "vision_encoder",
+    srcs = [
+        "third_party/perception_models/core/vision_encoder/config.py",
+        "third_party/perception_models/core/vision_encoder/pe.py",
+        "third_party/perception_models/core/vision_encoder/rope.py",
+    ],
+    data = [":dist_info"],
+    imports = ["third_party/perception_models"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@pypi//einops",
+        "@pypi//numpy",
+        "@pypi//timm",
+        "@pypi//torch",
+    ],
+)

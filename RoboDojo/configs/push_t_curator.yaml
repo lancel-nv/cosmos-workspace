@@ -1,0 +1,20 @@
+schema_version: 1
+kind: robot-action-split
+input:
+  uris:
+    - /datasets/push_T_generated/lerobot
+  source_dataset: robodojo_push_t
+split:
+  min_duration_s: 0.01
+  max_duration_s: null
+  skip_labels: []
+  skip_label_prefixes: []
+  skip_label_substrings: []
+  max_keep_per_description: 1000
+output:
+  media_root: /datasets/push_T_generated/curator
+  action_format: pickle
+  video_bitrate: 8M
+execution:
+  discovery_workers: 2
+  storage_profile: default
